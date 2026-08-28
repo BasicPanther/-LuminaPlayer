@@ -137,7 +137,7 @@ Below is an overview of the core interfaces in **Lumina Player**:
 
 ## License
 
-```text
+```text 
 Copyright 2026 Lumina Player Contributors
 
 Licensed under the Apache License, Version 2.0 (the "License");
