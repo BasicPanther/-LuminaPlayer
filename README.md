@@ -27,25 +27,36 @@
 
 ## Application Screenshots
 
-Below is an overview of the core interfaces in **Lumina Player**:
+<p align="center">
+  <img src="docs/screenshots/home.jpg" alt="Lumina Player Home Screen" width="30%" />
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="docs/screenshots/playback.jpg" alt="Lumina Player Playback Interface" width="60%" />
+</p>
 
-```
-+------------------------------------+  +------------------------------------+
-|  Lumina Player - Dashboard         |  |  Lumina Player - Media Player      |
-+------------------------------------+  +------------------------------------+
-| [ Search Movies & Shows... ]       |  | +--------------------------------+ |
-|                                    |  | |                                | |
-| Continue Watching                  |  | |         [ VIDEO CANVAS ]       | |
-|  [Poster 1]  [Poster 2]  [Poster 3]|  | |                                | |
-|   Movie A     Show S1E2   Movie B  |  | +--------------------------------+ |
-|                                    |  | Subtitle Tracks                  | |
-| Library Folders                    |  |  • Track 1 - [English - SRT]     | |
-|    /sdcard/Movies  (12 items)      |  |  • Local File: custom_sub.srt    | |
-|    /sdcard/TV      (8 items)       |  |    [ Remove Attached Subtitle ]   | |
-|                                    |  | Player Controls                  | |
-| Settings & API Keys                |  |  [ << 10s ]   [ PLAY ]   [ 10s >> ]| |
-+------------------------------------+  +------------------------------------+
-```
+---
+
+## Key Features
+
+- **Gesture-Driven Playback Engine**:
+  - **Press-and-Hold 2X Speed**: Long-press anywhere on the screen during video playback to trigger instant 2X playback speed, mirroring YouTube behavior with a visual HUD badge and haptic response. Releasing returns immediately to normal speed.
+  - **Vertical Edge Swipes**: Adjust display brightness on the left half of the display and system volume on the right half.
+  - **Horizontal Seeking**: Continuous swipe gestures with millisecond precision and custom seek HUD indicators.
+  - **Double-Tap Seeking**: Double-tap left or right sides to jump forward or backward in 10-second increments with ripple indicators.
+
+- **Subtitle Studio & Real-Time Sync**:
+  - **Live Dynamic Offset Engine**: Synchronizes external and sidecar subtitles with millisecond precision without freezing or restarting video playback.
+  - **Real-Time Visual Sync Preview**: Live cue preview box in the timing studio verifies dialogue timing against video frames before returning to playback.
+  - **Continuous Timing Scrubber & Precision Steppers**: Scrub timing between -5000ms and +5000ms, with quick one-tap steppers (-1s, -0.5s, Reset 0s, +0.5s, +1s) and microsecond fine tuners (+/-50ms, +/-100ms).
+  - **Multi-Format Parsing**: Built-in SRT and VTT subtitle parser supporting custom delays, timecode offsets, and subtitle styling.
+  - **Embedded & External Track Switching**: Easily switch between internal MKV/MP4 embedded streams and external `.srt`, `.vtt`, `.ass`, or `.sub` files.
+  - **Subtitle Customization**: Configure text size, background opacity, custom color shades, and font families on the fly.
+  - **Online Subtitle Fetching**: Automatic lookup and download of matching subtitle files from OpenSubtitles and TMDb.
+
+- **Library & Media Management**:
+  - **Automatic Directory Scanning**: Automatically catalogs movies, series, seasons, and episodes from internal and external storage.
+  - **Metadata Enrichment**: Auto-fetches high-resolution poster art, backdrops, episode summaries, and release dates.
+  - **Cloud Sync & Streaming**: Stream directly from Google Drive and remote sources with local caching and progress synchronization.
+  - **Smart Resume**: Automatically preserves exact playback positions per file and per episode.
 
 ---
 
@@ -111,20 +122,27 @@ Below is an overview of the core interfaces in **Lumina Player**:
 ## How to Use
 
 ### 1. Scanning Local Video Files
-- On first launch, grant storage / media permissions.
+- On first launch, grant storage and media permissions.
 - Tap **Scan Device Storage** or select custom directory folders in the **Library** tab.
-- Lumina Player will populate your movies and series automatically with poster artwork and episode ordering.
+- Lumina Player will automatically populate your movies and series with poster artwork, season categorization, and episode ordering.
 
-### 2. Managing Subtitles
-- **Select Subtitle Tracks**: Tap the **CC / Subtitle** button on the player overlay to view all detected embedded tracks and external files.
-- **Attach a Local Subtitle**: Tap **Attach Local File** to browse your device for `.srt`, `.vtt`, `.ass`, or `.ssa` files.
-- **Remove an Attached Subtitle**: Open the subtitle menu in the player overlay and tap **Remove Attached Subtitle File** (or tap the trash icon next to the active local track source) to clear it.
-- **Adjust Appearance**: Customize subtitle text size, background color, font family, and vertical positioning under player settings.
+### 2. Gesture Controls & Playback Speed
+- **YouTube-Style 2X Speed**: Press and hold anywhere on the video player during playback to accelerate to 2X speed instantly. The floating HUD indicator will confirm active 2X speed. Lift your finger to return to your standard speed immediately.
+- **Dedicated Speed Selector**: Tap the speed indicator badge in the top bar to choose preset playback speeds from 0.25x up to 2.0x.
+- **Brightness**: Swipe vertically along the left half of the display.
+- **Volume**: Swipe vertically along the right half of the display.
+- **Seek Scrubbing**: Swipe horizontally across the center of the display for fluid timeline scrubbing.
+- **Quick Jump**: Double-tap the left or right side of the screen to jump backward or forward 10 seconds.
 
-### 3. Gesture Controls
-- **Brightness**: Vertical swipe on the left side of the screen.
-- **Volume**: Vertical swipe on the right side of the screen.
-- **Seek**: Horizontal swipe anywhere on the video area.
+### 3. Subtitle Studio & Real-Time Sync
+- **Open Subtitle Studio**: Tap the **CC / Subtitles** button in the player overlay.
+- **Tracks & Sources**: Select from embedded container tracks, automatically detected sidecar files, or tap **Attach Local File** to load an external `.srt` or `.vtt` file. Tap the trash icon to detach any linked subtitle file.
+- **Timing & Sync**:
+  - **Live Cue Match**: Observe the live preview box to check the exact dialogue matching the current video timestamp.
+  - **Continuous Scrubber**: Drag the timing scrubber between -5000ms and +5000ms to immediately see cues shift in real time.
+  - **Tactile Steppers**: Use quick snap buttons (-1.0s, -0.5s, Reset 0s, +0.5s, +1.0s) for rapid adjustments.
+  - **Micro Precision**: Use fine adjustment steppers (+/-50ms, +/-100ms) to sync audio down to the exact phoneme.
+- **Visual Styling**: Customize subtitle text size (Small, Normal, Large, X-Large), font typography (Sans, Serif, Monospace), background opacity, and backdrop color shade with an interactive preview card.
 
 ---
 

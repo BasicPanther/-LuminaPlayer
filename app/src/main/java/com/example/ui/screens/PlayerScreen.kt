@@ -14,6 +14,9 @@ import androidx.annotation.OptIn
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.border
@@ -35,21 +38,32 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.data.service.SubtitleCue
+import com.example.data.service.SubtitleParser
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
-import com.example.data.model.MediaItem as AuraMediaItem
+import com.example.data.model.MediaItem as LuminaMediaItem
 import com.example.ui.viewmodel.MediaViewModel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -267,37 +281,45 @@ fun PlayerScreen(
     // Subtitle configurations
     var subtitleEnabled by remember { mutableStateOf(true) }
     var showSubtitlesMenu by remember { mutableStateOf(false) }
-    var subtitleDelayMs by remember { mutableStateOf(0) } // timing delay in ms
+    var subtitleDelayMs by remember { mutableIntStateOf(0) } // timing delay in ms (-10000ms to +10000ms)
 
-    // Active subtitle path (handles timing delay)
-    val activeSubtitlePathState = remember { mutableStateOf<String?>(null) }
+    // Active subtitle path and parsed cues for instant micro-second offset
+    var activeSubtitleFilePath by remember { mutableStateOf<String?>(null) }
+    var parsedSubtitleCues by remember { mutableStateOf<List<SubtitleCue>>(emptyList()) }
 
-    LaunchedEffect(item.subtitlePath, subtitleDelayMs) {
-        if (item.subtitlePath.isNullOrEmpty()) {
-            activeSubtitlePathState.value = null
-            return@LaunchedEffect
-        }
-        val origFile = File(item.subtitlePath)
-        if (!origFile.exists()) {
-            activeSubtitlePathState.value = null
-            return@LaunchedEffect
-        }
-        if (subtitleDelayMs == 0) {
-            activeSubtitlePathState.value = item.subtitlePath
-        } else {
-            // Read, shift, and save to a temporary cache file asynchronously
-            withContext(Dispatchers.IO) {
-                try {
-                    val content = origFile.readText()
-                    val shiftedContent = shiftSrtTiming(content, subtitleDelayMs)
-                    val tempSubFile = File(context.cacheDir, "temp_shifted_subs.srt")
-                    tempSubFile.writeText(shiftedContent)
-                    activeSubtitlePathState.value = tempSubFile.absolutePath
-                } catch (e: Exception) {
-                    android.util.Log.e("PlayerScreen", "Failed to shift SRT timing", e)
-                    activeSubtitlePathState.value = item.subtitlePath
-                }
+    // Playback Speed states (YouTube long-press 2X & speed selector)
+    var playbackSpeed by remember { mutableFloatStateOf(1.0f) }
+    var isFastForwarding2x by remember { mutableStateOf(false) }
+    var showSpeedDialog by remember { mutableStateOf(false) }
+
+    // Auto-detect and parse external or sidecar subtitle file
+    LaunchedEffect(item.subtitlePath, item.filePath) {
+        withContext(Dispatchers.IO) {
+            val path = if (!item.subtitlePath.isNullOrEmpty() && File(item.subtitlePath).exists()) {
+                item.subtitlePath
+            } else {
+                val localPath = if (item.filePath.startsWith("/")) item.filePath else null
+                val sidecars = if (localPath != null) findSidecarSubtitleFiles(localPath) else emptyList()
+                sidecars.firstOrNull()?.absolutePath
             }
+
+            activeSubtitleFilePath = path
+            if (path != null) {
+                val cues = SubtitleParser.parseFile(File(path))
+                parsedSubtitleCues = cues
+            } else {
+                parsedSubtitleCues = emptyList()
+            }
+        }
+    }
+
+    // Active subtitle cue calculated in real-time with instant millisecond offset!
+    val activeSubtitleCue = remember(currentPosition, subtitleDelayMs, parsedSubtitleCues, subtitleEnabled) {
+        if (!subtitleEnabled || parsedSubtitleCues.isEmpty()) {
+            null
+        } else {
+            val targetPlaybackTimeMs = currentPosition - subtitleDelayMs
+            SubtitleParser.getActiveCue(parsedSubtitleCues, targetPlaybackTimeMs)
         }
     }
 
@@ -362,9 +384,8 @@ fun PlayerScreen(
     val currentAutoplayEnabled = rememberUpdatedState(autoplayEnabled)
     val currentNextEpisode = rememberUpdatedState(nextEpisode)
     
-    // ExoPlayer Lifetime managed by resolvedStreamUrl, activeSubtitlePathState.value, and accessToken
-    val activeSubPath = activeSubtitlePathState.value
-    DisposableEffect(resolvedStreamUrl, activeSubPath, accessToken) {
+    // ExoPlayer Lifetime managed by resolvedStreamUrl and accessToken
+    DisposableEffect(resolvedStreamUrl, accessToken) {
         val streamUrl = resolvedStreamUrl
         if (streamUrl == null) {
             return@DisposableEffect onDispose {}
@@ -509,8 +530,9 @@ fun PlayerScreen(
 
         val subConfigs = mutableListOf<MediaItem.SubtitleConfiguration>()
 
-        if (!activeSubPath.isNullOrEmpty()) {
-            val subFile = File(activeSubPath)
+        val primarySubPath = activeSubtitleFilePath ?: item.subtitlePath
+        if (!primarySubPath.isNullOrEmpty()) {
+            val subFile = File(primarySubPath)
             if (subFile.exists()) {
                 val mimeType = getMimeTypeForSubFile(subFile)
                 subConfigs.add(
@@ -622,7 +644,7 @@ fun PlayerScreen(
         val syncJob = scope.launch {
             var lastDbUpdateTime = 0L
             while (true) {
-                delay(250)
+                delay(80)
                 exoPlayer?.let { p ->
                     currentPosition = p.currentPosition
                     duration = p.duration
@@ -743,13 +765,68 @@ fun PlayerScreen(
                 
                 // Apply dynamic subtitle styling & visibility
                 view.subtitleView?.let { subtitleView ->
-                    subtitleView.visibility = if (subtitleEnabled) android.view.View.VISIBLE else android.view.View.GONE
+                    val hasParsedCues = parsedSubtitleCues.isNotEmpty()
+                    subtitleView.visibility = if (subtitleEnabled && !hasParsedCues) android.view.View.VISIBLE else android.view.View.GONE
                     val captionStyle = getCaptionStyle(subBgColor, subBgOpacity, subFont)
                     subtitleView.setStyle(captionStyle)
                     subtitleView.setFractionalTextSize(subTextSize * 0.053f)
                 }
             }
         )
+
+        // Compose Subtitle Overlay (Real-Time Zero-Latency Offset & Sync Engine)
+        if (subtitleEnabled && parsedSubtitleCues.isNotEmpty() && activeSubtitleCue != null) {
+            val bottomPadding = if (areControlsVisible) 94.dp else 36.dp
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 24.dp)
+                    .padding(bottom = bottomPadding),
+                contentAlignment = Alignment.BottomCenter
+            ) {
+                val currentBgColor = when (subBgColor) {
+                    "BLACK" -> Color.Black
+                    "DARK_GRAY" -> Color(0xFF212121)
+                    "BLUE" -> Color(0xFF0D47A1)
+                    "RED" -> Color(0xFFB71C1C)
+                    "YELLOW" -> Color(0xFFF57F17)
+                    else -> Color.Black
+                }.copy(alpha = subBgOpacity)
+
+                val currentFontFamily = when (subFont) {
+                    "SANS_SERIF" -> FontFamily.SansSerif
+                    "SERIF" -> FontFamily.Serif
+                    "MONOSPACE" -> FontFamily.Monospace
+                    "CURSIVE" -> FontFamily.Cursive
+                    else -> FontFamily.Default
+                }
+
+                Surface(
+                    color = currentBgColor,
+                    shape = RoundedCornerShape(6.dp),
+                    border = if (subBgOpacity < 0.2f) BorderStroke(1.dp, Color.Black.copy(alpha = 0.5f)) else null,
+                    modifier = Modifier.padding(horizontal = 8.dp)
+                ) {
+                    Text(
+                        text = activeSubtitleCue.text,
+                        color = Color.White,
+                        fontSize = (16 * subTextSize).sp,
+                        fontFamily = currentFontFamily,
+                        fontWeight = FontWeight.SemiBold,
+                        textAlign = TextAlign.Center,
+                        lineHeight = (22 * subTextSize).sp,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        style = TextStyle(
+                            shadow = Shadow(
+                                color = Color.Black.copy(alpha = 0.95f),
+                                offset = Offset(2f, 2f),
+                                blurRadius = 5f
+                            )
+                        )
+                    )
+                }
+            }
+        }
 
         if (isResolvingUrl || exoPlayer == null) {
             Box(
@@ -771,8 +848,11 @@ fun PlayerScreen(
             }
         }
 
-        // Central Gesture Pad (handles decreased sensitivity swipes, taps, and double-taps)
+        // Central Gesture Pad (handles decreased sensitivity swipes, taps, double-taps, and YouTube-style 2X speed long-press)
         var accumulatedDragY by remember { mutableStateOf(0f) }
+        val haptic = LocalHapticFeedback.current
+        var wasLongPressed by remember { mutableStateOf(false) }
+
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -794,9 +874,33 @@ fun PlayerScreen(
                         }
                     )
                 }
-                .pointerInput(Unit) {
+                .pointerInput(playbackSpeed, isPlayerPlaying) {
                     detectTapGestures(
+                        onPress = { offset ->
+                            val pressJob = scope.launch {
+                                delay(380) // YouTube long press hold threshold
+                                if (isPlayerPlaying) {
+                                    wasLongPressed = true
+                                    isFastForwarding2x = true
+                                    exoPlayer?.setPlaybackSpeed(2.0f)
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                }
+                            }
+                            try {
+                                tryAwaitRelease()
+                            } finally {
+                                pressJob.cancel()
+                                if (isFastForwarding2x) {
+                                    isFastForwarding2x = false
+                                    exoPlayer?.setPlaybackSpeed(playbackSpeed)
+                                }
+                            }
+                        },
                         onTap = { offset ->
+                            if (wasLongPressed) {
+                                wasLongPressed = false
+                                return@detectTapGestures
+                            }
                             lastUserActivityTime = System.currentTimeMillis()
                             val screenWidth = size.width
                             val x = offset.x
@@ -882,6 +986,43 @@ fun PlayerScreen(
                     )
                 }
         )
+
+        // YouTube-style 2X Speed HUD Floating Badge
+        AnimatedVisibility(
+            visible = isFastForwarding2x,
+            enter = fadeIn() + scaleIn(initialScale = 0.85f),
+            exit = fadeOut() + scaleOut(targetScale = 0.85f),
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .padding(top = 44.dp)
+        ) {
+            Surface(
+                color = Color(0xEE0D0D17),
+                shape = RoundedCornerShape(24.dp),
+                border = BorderStroke(1.5.dp, Color(0xFF00E5FF)),
+                shadowElevation = 12.dp
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.FastForward,
+                        contentDescription = "2X Speed",
+                        tint = Color(0xFF00E5FF),
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Text(
+                        text = "2X Speed",
+                        color = Color.White,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        letterSpacing = 0.8.sp
+                    )
+                }
+            }
+        }
 
         // Overlay Control Triggers
         if (!com.example.MainActivity.isInPipMode.value) {
@@ -1038,6 +1179,27 @@ fun PlayerScreen(
                                 )
                             }
 
+                            // Playback Speed Button
+                            IconButton(
+                                onClick = { showSpeedDialog = true },
+                                modifier = Modifier.testTag("speed_button")
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .background(if (playbackSpeed != 1.0f) Color(0xFF00E5FF).copy(alpha = 0.22f) else Color.White.copy(alpha = 0.12f))
+                                        .padding(horizontal = 7.dp, vertical = 4.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = if (playbackSpeed == 1.0f) "1x" else "${playbackSpeed}x",
+                                        color = if (playbackSpeed != 1.0f) Color(0xFF00E5FF) else Color.White,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.ExtraBold
+                                    )
+                                }
+                            }
+
                             // Subtitle Settings & Overhaul Button
                             IconButton(
                                 onClick = { showSubtitlesMenu = true },
@@ -1046,7 +1208,7 @@ fun PlayerScreen(
                                 Icon(
                                     imageVector = Icons.Default.Subtitles, 
                                     contentDescription = "Subtitles Menu", 
-                                    tint = if (subtitleEnabled && !item.subtitlePath.isNullOrEmpty()) Color(0xFF00E5FF) else Color.White
+                                    tint = if (subtitleEnabled && (!item.subtitlePath.isNullOrEmpty() || parsedSubtitleCues.isNotEmpty())) Color(0xFF00E5FF) else Color.White
                                 )
                             }
 
@@ -1895,24 +2057,32 @@ fun PlayerScreen(
                             }
 
                             2 -> {
-                                // TAB 2: SYNC OFFSET
+                                // TAB 2: TIMING & SYNC (Live Interactive Sync Engine)
                                 Column(
-                                    verticalArrangement = Arrangement.spacedBy(14.dp),
+                                    verticalArrangement = Arrangement.spacedBy(12.dp),
                                     horizontalAlignment = Alignment.CenterHorizontally
                                 ) {
-                                    // Big Offset Card Display
+                                    // Hero Offset Readout Card
                                     Box(
                                         modifier = Modifier
                                             .fillMaxWidth()
-                                            .background(Color(0xFF181826), RoundedCornerShape(12.dp))
-                                            .padding(vertical = 16.dp, horizontal = 12.dp),
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .background(Color(0xFF181826))
+                                            .border(1.dp, Color(0xFF00E5FF).copy(alpha = 0.25f), RoundedCornerShape(12.dp))
+                                            .padding(vertical = 14.dp, horizontal = 14.dp),
                                         contentAlignment = Alignment.Center
                                     ) {
                                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                            Text("CURRENT TIMING OFFSET", fontSize = 9.sp, color = Color.Gray, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
-                                            Spacer(modifier = Modifier.height(6.dp))
                                             Text(
-                                                text = if (subtitleDelayMs == 0) "0.0s (In Sync)" else String.format("%+.1fs", subtitleDelayMs / 1000f),
+                                                text = "CURRENT TIMING OFFSET",
+                                                fontSize = 9.sp,
+                                                color = Color.Gray,
+                                                fontWeight = FontWeight.Bold,
+                                                letterSpacing = 1.sp
+                                            )
+                                            Spacer(modifier = Modifier.height(4.dp))
+                                            Text(
+                                                text = if (subtitleDelayMs == 0) "0.0s (In Sync)" else String.format("%+.2fs (%+dms)", subtitleDelayMs / 1000f, subtitleDelayMs),
                                                 color = Color(0xFF00E5FF),
                                                 fontSize = 24.sp,
                                                 fontWeight = FontWeight.ExtraBold
@@ -1920,9 +2090,9 @@ fun PlayerScreen(
                                             Spacer(modifier = Modifier.height(4.dp))
                                             Text(
                                                 text = when {
-                                                    subtitleDelayMs > 0 -> "Subtitles delayed by ${subtitleDelayMs}ms"
-                                                    subtitleDelayMs < 0 -> "Subtitles advanced by ${-subtitleDelayMs}ms"
-                                                    else -> "Subtitles perfectly synchronized with video"
+                                                    subtitleDelayMs > 0 -> "Subtitles delayed by ${subtitleDelayMs}ms (appear later)"
+                                                    subtitleDelayMs < 0 -> "Subtitles advanced by ${-subtitleDelayMs}ms (appear earlier)"
+                                                    else -> "Subtitles synchronized to original video stream"
                                                 },
                                                 color = Color.LightGray,
                                                 fontSize = 10.sp
@@ -1930,16 +2100,117 @@ fun PlayerScreen(
                                         }
                                     }
 
+                                    // Live Real-Time Subtitle Preview Box
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(10.dp))
+                                            .background(Color(0xFF0C0C16))
+                                            .border(1.dp, Color.White.copy(alpha = 0.12f), RoundedCornerShape(10.dp))
+                                            .padding(12.dp)
+                                    ) {
+                                        Column {
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                                    Icon(
+                                                        imageVector = Icons.Default.Visibility,
+                                                        contentDescription = null,
+                                                        tint = Color(0xFF00E5FF),
+                                                        modifier = Modifier.size(13.dp)
+                                                    )
+                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                    Text(
+                                                        text = "LIVE SYNC PREVIEW AT ${formatTime((currentPosition - subtitleDelayMs).coerceAtLeast(0))}",
+                                                        fontSize = 9.sp,
+                                                        color = Color(0xFF00E5FF),
+                                                        fontWeight = FontWeight.Bold,
+                                                        letterSpacing = 0.5.sp
+                                                    )
+                                                }
+                                                Box(
+                                                    modifier = Modifier
+                                                        .clip(RoundedCornerShape(4.dp))
+                                                        .background(if (activeSubtitleCue != null) Color(0xFF00E676).copy(alpha = 0.2f) else Color.White.copy(alpha = 0.08f))
+                                                        .padding(horizontal = 5.dp, vertical = 2.dp)
+                                                ) {
+                                                    Text(
+                                                        text = if (activeSubtitleCue != null) "CUE MATCH" else "IDLE",
+                                                        fontSize = 8.sp,
+                                                        color = if (activeSubtitleCue != null) Color(0xFF00E676) else Color.Gray,
+                                                        fontWeight = FontWeight.Bold
+                                                    )
+                                                }
+                                            }
+
+                                            Spacer(modifier = Modifier.height(6.dp))
+
+                                            Box(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .heightIn(min = 42.dp),
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                Text(
+                                                    text = activeSubtitleCue?.text
+                                                        ?: if (parsedSubtitleCues.isEmpty()) "Load or download a subtitle file (.srt/.vtt) in Tracks tab to enable live microsecond sync preview."
+                                                        else "(No spoken dialogue at this video timestamp)",
+                                                    color = if (activeSubtitleCue != null) Color.White else Color.Gray,
+                                                    fontSize = 11.sp,
+                                                    fontWeight = if (activeSubtitleCue != null) FontWeight.SemiBold else FontWeight.Normal,
+                                                    textAlign = TextAlign.Center,
+                                                    modifier = Modifier.padding(horizontal = 6.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+
+                                    // Continuous Slider Scrubber
+                                    Column(modifier = Modifier.fillMaxWidth()) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Text("CONTINUOUS TIMING SCRUBBER", fontSize = 9.sp, color = Color.Gray, fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp)
+                                            Text(
+                                                text = "${subtitleDelayMs}ms",
+                                                fontSize = 10.sp,
+                                                color = Color(0xFF00E5FF),
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
+                                        Slider(
+                                            value = subtitleDelayMs.toFloat(),
+                                            onValueChange = {
+                                                subtitleDelayMs = (it / 50).toInt() * 50 // 50ms quantize
+                                            },
+                                            valueRange = -5000f..5000f,
+                                            colors = SliderDefaults.colors(
+                                                thumbColor = Color(0xFF00E5FF),
+                                                activeTrackColor = Color(0xFF00E5FF),
+                                                inactiveTrackColor = Color(0xFF1E1E30)
+                                            ),
+                                            modifier = Modifier.fillMaxWidth().height(28.dp)
+                                        )
+                                    }
+
                                     // Large Step Adjusters
                                     Column(modifier = Modifier.fillMaxWidth()) {
                                         Text("QUICK OFFSET ADJUSTMENT", fontSize = 9.sp, color = Color.Gray, fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp)
-                                        Spacer(modifier = Modifier.height(8.dp))
+                                        Spacer(modifier = Modifier.height(6.dp))
                                         Row(
                                             modifier = Modifier.fillMaxWidth(),
-                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                            horizontalArrangement = Arrangement.spacedBy(5.dp)
                                         ) {
                                             Button(
-                                                onClick = { subtitleDelayMs -= 1000 },
+                                                onClick = {
+                                                    subtitleDelayMs -= 1000
+                                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                },
                                                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF181826)),
                                                 shape = RoundedCornerShape(8.dp),
                                                 modifier = Modifier.weight(1f).height(36.dp),
@@ -1949,7 +2220,10 @@ fun PlayerScreen(
                                             }
 
                                             Button(
-                                                onClick = { subtitleDelayMs -= 500 },
+                                                onClick = {
+                                                    subtitleDelayMs -= 500
+                                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                },
                                                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF181826)),
                                                 shape = RoundedCornerShape(8.dp),
                                                 modifier = Modifier.weight(1f).height(36.dp),
@@ -1959,17 +2233,23 @@ fun PlayerScreen(
                                             }
 
                                             Button(
-                                                onClick = { subtitleDelayMs = 0 },
-                                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E5FF).copy(alpha = 0.15f)),
+                                                onClick = {
+                                                    subtitleDelayMs = 0
+                                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                },
+                                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E5FF).copy(alpha = 0.18f)),
                                                 shape = RoundedCornerShape(8.dp),
-                                                modifier = Modifier.weight(1f).height(36.dp),
+                                                modifier = Modifier.weight(1.1f).height(36.dp),
                                                 contentPadding = PaddingValues(0.dp)
                                             ) {
-                                                Text("Reset", color = Color(0xFF00E5FF), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                                Text("Reset 0s", color = Color(0xFF00E5FF), fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
                                             }
 
                                             Button(
-                                                onClick = { subtitleDelayMs += 500 },
+                                                onClick = {
+                                                    subtitleDelayMs += 500
+                                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                },
                                                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF181826)),
                                                 shape = RoundedCornerShape(8.dp),
                                                 modifier = Modifier.weight(1f).height(36.dp),
@@ -1979,7 +2259,10 @@ fun PlayerScreen(
                                             }
 
                                             Button(
-                                                onClick = { subtitleDelayMs += 1000 },
+                                                onClick = {
+                                                    subtitleDelayMs += 1000
+                                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                },
                                                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF181826)),
                                                 shape = RoundedCornerShape(8.dp),
                                                 modifier = Modifier.weight(1f).height(36.dp),
@@ -1990,27 +2273,100 @@ fun PlayerScreen(
                                         }
                                     }
 
-                                    // Fine Step Adjusters
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                    ) {
-                                        Button(
-                                            onClick = { subtitleDelayMs -= 100 },
-                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF181826)),
-                                            shape = RoundedCornerShape(8.dp),
-                                            modifier = Modifier.weight(1f).height(36.dp)
+                                    // Micro-Fine Precision Adjusters
+                                    Column(modifier = Modifier.fillMaxWidth()) {
+                                        Text("FINE MICROSECOND ADJUSTMENT", fontSize = 9.sp, color = Color.Gray, fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp)
+                                        Spacer(modifier = Modifier.height(6.dp))
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.spacedBy(5.dp)
                                         ) {
-                                            Text("Fine -100ms", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
-                                        }
+                                            Button(
+                                                onClick = {
+                                                    subtitleDelayMs -= 100
+                                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                },
+                                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF181826)),
+                                                shape = RoundedCornerShape(8.dp),
+                                                modifier = Modifier.weight(1f).height(34.dp),
+                                                contentPadding = PaddingValues(0.dp)
+                                            ) {
+                                                Text("-100ms", color = Color.LightGray, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
+                                            }
 
+                                            Button(
+                                                onClick = {
+                                                    subtitleDelayMs -= 50
+                                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                },
+                                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF181826)),
+                                                shape = RoundedCornerShape(8.dp),
+                                                modifier = Modifier.weight(1f).height(34.dp),
+                                                contentPadding = PaddingValues(0.dp)
+                                            ) {
+                                                Text("-50ms", color = Color.LightGray, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
+                                            }
+
+                                            Button(
+                                                onClick = {
+                                                    subtitleDelayMs += 50
+                                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                },
+                                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF181826)),
+                                                shape = RoundedCornerShape(8.dp),
+                                                modifier = Modifier.weight(1f).height(34.dp),
+                                                contentPadding = PaddingValues(0.dp)
+                                            ) {
+                                                Text("+50ms", color = Color.LightGray, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
+                                            }
+
+                                            Button(
+                                                onClick = {
+                                                    subtitleDelayMs += 100
+                                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                },
+                                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF181826)),
+                                                shape = RoundedCornerShape(8.dp),
+                                                modifier = Modifier.weight(1f).height(34.dp),
+                                                contentPadding = PaddingValues(0.dp)
+                                            ) {
+                                                Text("+100ms", color = Color.LightGray, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
+                                            }
+                                        }
+                                    }
+
+                                    // Helpful Sync Guidance Banner
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .background(Color(0xFF121220))
+                                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(Icons.Default.Info, contentDescription = null, tint = Color(0xFF00E5FF), modifier = Modifier.size(15.dp))
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(
+                                            text = "Actors talking before words show? Tap [+] Delay. Words showing before speech? Tap [-] Advance.",
+                                            color = Color.LightGray,
+                                            fontSize = 10.sp,
+                                            lineHeight = 13.sp
+                                        )
+                                    }
+
+                                    // Download Button if no subtitle cues
+                                    if (parsedSubtitleCues.isEmpty()) {
                                         Button(
-                                            onClick = { subtitleDelayMs += 100 },
-                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF181826)),
+                                            onClick = {
+                                                viewModel.downloadSubtitles(context, item, "English")
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E5FF).copy(alpha = 0.2f)),
                                             shape = RoundedCornerShape(8.dp),
-                                            modifier = Modifier.weight(1f).height(36.dp)
+                                            modifier = Modifier.fillMaxWidth().height(36.dp)
                                         ) {
-                                            Text("Fine +100ms", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                                            Icon(Icons.Default.CloudDownload, contentDescription = null, tint = Color(0xFF00E5FF), modifier = Modifier.size(15.dp))
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text("Download Subtitles for Real-Time Sync", color = Color(0xFF00E5FF), fontSize = 11.sp, fontWeight = FontWeight.Bold)
                                         }
                                     }
                                 }
@@ -2026,6 +2382,65 @@ fun PlayerScreen(
                         modifier = Modifier.fillMaxWidth().height(40.dp)
                     ) {
                         Text("Done", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    }
+                }
+            )
+        }
+
+        // Playback Speed Selector Dialog
+        if (showSpeedDialog) {
+            AlertDialog(
+                onDismissRequest = { showSpeedDialog = false },
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Speed, contentDescription = null, tint = Color(0xFF00E5FF), modifier = Modifier.size(20.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Playback Speed", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    }
+                },
+                containerColor = Color(0xFF12121E),
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            text = "Tip: You can also press and hold anywhere on screen during video playback to jump to 2X speed instantly.",
+                            color = Color(0xFF00E5FF).copy(alpha = 0.85f),
+                            fontSize = 11.sp,
+                            lineHeight = 15.sp,
+                            modifier = Modifier.padding(bottom = 8.dp)
+                        )
+                        val speedOptions = listOf(0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f)
+                        speedOptions.forEach { spd ->
+                            val isSelected = kotlin.math.abs(playbackSpeed - spd) < 0.05f
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(if (isSelected) Color(0xFF00E5FF).copy(alpha = 0.15f) else Color.Transparent)
+                                    .clickable {
+                                        playbackSpeed = spd
+                                        exoPlayer?.setPlaybackSpeed(spd)
+                                        showSpeedDialog = false
+                                    }
+                                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = if (spd == 1.0f) "1.0x (Normal)" else "${spd}x",
+                                    color = if (isSelected) Color(0xFF00E5FF) else Color.White,
+                                    fontSize = 13.sp,
+                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                                )
+                                if (isSelected) {
+                                    Icon(Icons.Default.Check, contentDescription = null, tint = Color(0xFF00E5FF), modifier = Modifier.size(16.dp))
+                                }
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { showSpeedDialog = false }) {
+                        Text("Close", color = Color(0xFF00E5FF), fontWeight = FontWeight.Bold)
                     }
                 }
             )

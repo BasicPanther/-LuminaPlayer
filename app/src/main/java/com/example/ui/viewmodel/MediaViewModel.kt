@@ -83,7 +83,7 @@ class MediaViewModel(private val repository: MediaRepository) : ViewModel() {
     val subStyleFont: StateFlow<String> = _subStyleFont.asStateFlow()
 
     fun loadPreferences(context: Context) {
-        val prefs = context.getSharedPreferences("aura_player_prefs", Context.MODE_PRIVATE)
+        val prefs = context.getSharedPreferences("lumina_player_prefs", Context.MODE_PRIVATE)
         
         // TMDB API key
         _tmdbApiKey.value = prefs.getString("tmdb_api_key", "") ?: ""
@@ -121,13 +121,13 @@ class MediaViewModel(private val repository: MediaRepository) : ViewModel() {
     }
 
     fun saveTmdbApiKey(context: Context, key: String) {
-        val prefs = context.getSharedPreferences("aura_player_prefs", Context.MODE_PRIVATE)
+        val prefs = context.getSharedPreferences("lumina_player_prefs", Context.MODE_PRIVATE)
         prefs.edit().putString("tmdb_api_key", key.trim()).apply()
         _tmdbApiKey.value = key.trim()
     }
 
     fun saveOmdbApiKey(context: Context, key: String) {
-        val prefs = context.getSharedPreferences("aura_player_prefs", Context.MODE_PRIVATE)
+        val prefs = context.getSharedPreferences("lumina_player_prefs", Context.MODE_PRIVATE)
         prefs.edit().putString("omdb_api_key", key.trim()).apply()
         _omdbApiKey.value = key.trim()
     }
@@ -490,7 +490,7 @@ class MediaViewModel(private val repository: MediaRepository) : ViewModel() {
     }
 
     fun setAutoplayEnabled(context: Context, enabled: Boolean) {
-        val prefs = context.getSharedPreferences("aura_player_prefs", Context.MODE_PRIVATE)
+        val prefs = context.getSharedPreferences("lumina_player_prefs", Context.MODE_PRIVATE)
         prefs.edit().putBoolean("autoplay_enabled", enabled).apply()
         _autoplayEnabled.value = enabled
     }
@@ -498,7 +498,7 @@ class MediaViewModel(private val repository: MediaRepository) : ViewModel() {
     fun addScannedFolder(context: Context, path: String) {
         val cleanPath = path.trim()
         if (cleanPath.isEmpty()) return
-        val prefs = context.getSharedPreferences("aura_player_prefs", Context.MODE_PRIVATE)
+        val prefs = context.getSharedPreferences("lumina_player_prefs", Context.MODE_PRIVATE)
         val foldersSet = prefs.getStringSet("scanned_directories", emptySet())?.toMutableSet() ?: mutableSetOf()
         foldersSet.add(cleanPath)
         prefs.edit().putStringSet("scanned_directories", foldersSet).apply()
@@ -506,7 +506,7 @@ class MediaViewModel(private val repository: MediaRepository) : ViewModel() {
     }
 
     fun removeScannedFolder(context: Context, path: String) {
-        val prefs = context.getSharedPreferences("aura_player_prefs", Context.MODE_PRIVATE)
+        val prefs = context.getSharedPreferences("lumina_player_prefs", Context.MODE_PRIVATE)
         val foldersSet = prefs.getStringSet("scanned_directories", emptySet())?.toMutableSet() ?: return
         foldersSet.remove(path)
         prefs.edit().putStringSet("scanned_directories", foldersSet).apply()
@@ -697,7 +697,7 @@ class MediaViewModel(private val repository: MediaRepository) : ViewModel() {
         textSize: Float,
         font: String
     ) {
-        val prefs = context.getSharedPreferences("aura_player_prefs", Context.MODE_PRIVATE)
+        val prefs = context.getSharedPreferences("lumina_player_prefs", Context.MODE_PRIVATE)
         prefs.edit().apply {
             putString("sub_style_bg_color", bgColor)
             putFloat("sub_style_bg_opacity", bgOpacity)

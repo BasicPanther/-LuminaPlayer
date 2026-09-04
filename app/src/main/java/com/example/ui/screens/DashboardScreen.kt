@@ -120,7 +120,7 @@ fun DashboardScreen(
     var selectedShowForFixMatch by remember { mutableStateOf<TvShow?>(null) }
     val savedTmdbApiKey by viewModel.tmdbApiKey.collectAsStateWithLifecycle()
 
-    val prefs = remember { context.getSharedPreferences("aura_player_prefs", android.content.Context.MODE_PRIVATE) }
+    val prefs = remember { context.getSharedPreferences("lumina_player_prefs", android.content.Context.MODE_PRIVATE) }
     var showFirstTimePermissionPopup by remember {
         mutableStateOf(prefs.getBoolean("is_first_time_use", true))
     }
@@ -308,7 +308,7 @@ fun DashboardScreen(
                 ) {
                     Column {
                         Text(
-                            text = "AURA PLAYER",
+                            text = "LUMINA PLAYER",
                             fontSize = 24.sp,
                             fontWeight = FontWeight.ExtraBold,
                             letterSpacing = 2.sp,
