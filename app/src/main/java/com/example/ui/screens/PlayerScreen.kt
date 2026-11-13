@@ -60,10 +60,13 @@ import com.example.data.service.SubtitleCue
 import com.example.data.service.SubtitleParser
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.example.data.model.MediaItem as LuminaMediaItem
+import com.example.data.service.CloudSyncService
+import com.example.data.service.SmbDataSource
 import com.example.ui.viewmodel.MediaViewModel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -356,9 +359,13 @@ fun PlayerScreen(
 
     var resolvedStreamUrl by remember { mutableStateOf<String?>(null) }
     var isResolvingUrl by remember { mutableStateOf(false) }
+    var playbackErrorMessage by remember { mutableStateOf<String?>(null) }
+    var isBuffering by remember { mutableStateOf(false) }
+    var playerRetryNonce by remember { mutableIntStateOf(0) }
 
-    LaunchedEffect(mediaItemId, accessToken) {
+    LaunchedEffect(mediaItemId, accessToken, playerRetryNonce) {
         isResolvingUrl = true
+        playbackErrorMessage = null
         val downloadedFile = viewModel.getDownloadedFile(context, item)
         val isDownloaded = (item.filePath.startsWith("/") && java.io.File(item.filePath).exists()) || downloadedFile.exists()
         if (isDownloaded) {
@@ -370,7 +377,7 @@ fun PlayerScreen(
             } else {
                 item.filePath
             }
-            
+
             if (fileId != null) {
                 resolvedStreamUrl = com.example.data.service.GoogleDriveResolver.resolveGoogleDriveUrl(rawUrl, accessToken)
             } else {
@@ -383,73 +390,85 @@ fun PlayerScreen(
     // Setup updated state references for listeners
     val currentAutoplayEnabled = rememberUpdatedState(autoplayEnabled)
     val currentNextEpisode = rememberUpdatedState(nextEpisode)
-    
-    // ExoPlayer Lifetime managed by resolvedStreamUrl and accessToken
-    DisposableEffect(resolvedStreamUrl, accessToken) {
+
+    // ExoPlayer Lifetime managed by resolvedStreamUrl, accessToken, and retry trigger
+    DisposableEffect(resolvedStreamUrl, accessToken, playerRetryNonce) {
         val streamUrl = resolvedStreamUrl
         if (streamUrl == null) {
             return@DisposableEffect onDispose {}
         }
+        playbackErrorMessage = null
 
-        var finalStreamUrl = streamUrl
+        val (extractedUrl, basicAuthHeader) = CloudSyncService.extractUrlAndAuth(streamUrl)
+        var finalStreamUrl = extractedUrl
         val fileId = if (item.id.startsWith("gdrive_")) item.id.removePrefix("gdrive_") else null
         val headers = mutableMapOf<String, String>()
-
-        // Support basic authentication in URL (e.g. TrueNAS/WebDAV http://user:pass@host/path)
-        if (streamUrl.startsWith("http") && streamUrl.contains("@")) {
-            try {
-                val schemeIdx = streamUrl.indexOf("://")
-                if (schemeIdx != -1) {
-                    val scheme = streamUrl.substring(0, schemeIdx + 3)
-                    val withoutScheme = streamUrl.substring(schemeIdx + 3)
-                    val atIdx = withoutScheme.indexOf("@")
-                    if (atIdx != -1) {
-                        val credentials = withoutScheme.substring(0, atIdx)
-                        val rest = withoutScheme.substring(atIdx + 1)
-                        val colonIdx = credentials.indexOf(":")
-                        if (colonIdx != -1) {
-                            val username = java.net.URLDecoder.decode(credentials.substring(0, colonIdx), "UTF-8")
-                            val password = java.net.URLDecoder.decode(credentials.substring(colonIdx + 1), "UTF-8")
-                            headers["Authorization"] = okhttp3.Credentials.basic(username, password)
-                        } else {
-                            val username = java.net.URLDecoder.decode(credentials, "UTF-8")
-                            headers["Authorization"] = okhttp3.Credentials.basic(username, "")
-                        }
-                        finalStreamUrl = scheme + rest
-                    }
-                }
-            } catch (e: Exception) {
-                android.util.Log.e("PlayerScreen", "Error extracting basic auth headers", e)
-            }
+        if (basicAuthHeader != null) {
+            headers["Authorization"] = basicAuthHeader
         }
 
-        val defaultHttpDataSourceFactory = androidx.media3.datasource.DefaultHttpDataSource.Factory()
-            .setAllowCrossProtocolRedirects(true)
-        
         if (fileId != null && !accessToken.isNullOrBlank() && finalStreamUrl.startsWith("https://www.googleapis.com/")) {
             headers["Authorization"] = "Bearer $accessToken"
         }
 
-        val cookies = com.example.data.service.GoogleDriveResolver.gdriveCookies[finalStreamUrl] ?: com.example.data.service.GoogleDriveResolver.gdriveCookies[streamUrl]
+        val cookies = com.example.data.service.GoogleDriveResolver.gdriveCookies[finalStreamUrl]
+            ?: com.example.data.service.GoogleDriveResolver.gdriveCookies[streamUrl]
         if (!cookies.isNullOrBlank()) {
             headers["Cookie"] = cookies
         }
 
         headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-        if (headers.isNotEmpty()) {
-            defaultHttpDataSourceFactory.setDefaultRequestProperties(headers)
+        val okHttpDataSourceFactory = androidx.media3.datasource.okhttp.OkHttpDataSource.Factory(
+            CloudSyncService.getUnsafeOkHttpClient()
+        ).apply {
+            if (headers.isNotEmpty()) {
+                setDefaultRequestProperties(headers)
+            }
         }
 
-        val dataSourceFactory = androidx.media3.datasource.DefaultDataSource.Factory(context, defaultHttpDataSourceFactory)
+        val defaultDataSourceFactory = androidx.media3.datasource.DefaultDataSource.Factory(context, okHttpDataSourceFactory)
+        val smbDataSourceFactory = SmbDataSource.Factory()
 
-        // Wrap with CacheDataSource for segment-based chunked buffering to save bandwidth!
-        val cacheDataSourceFactory = androidx.media3.datasource.cache.CacheDataSource.Factory()
-            .setCache(getSimpleCache(context))
-            .setUpstreamDataSourceFactory(dataSourceFactory)
-            .setFlags(androidx.media3.datasource.cache.CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+        // Route smb:// to SmbDataSource and http(s)/file/content to OkHttp-backed DefaultDataSource
+        val routingDataSourceFactory = androidx.media3.datasource.DataSource.Factory {
+            object : androidx.media3.datasource.DataSource {
+                private var delegate: androidx.media3.datasource.DataSource? = null
 
-        // Custom minimalistic load control to limit buffer duration (only buffer 15-30 seconds of video to avoid hitting GDrive quota)
+                override fun addTransferListener(transferListener: androidx.media3.datasource.TransferListener) {
+                    // Transfer listeners attached on active delegate
+                }
+
+                override fun open(dataSpec: androidx.media3.datasource.DataSpec): Long {
+                    val active = if (dataSpec.uri.scheme.equals("smb", ignoreCase = true)) {
+                        smbDataSourceFactory.createDataSource()
+                    } else {
+                        defaultDataSourceFactory.createDataSource()
+                    }
+                    delegate = active
+                    return active.open(dataSpec)
+                }
+
+                override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                    return delegate?.read(buffer, offset, length) ?: C.RESULT_END_OF_INPUT
+                }
+
+                override fun getUri(): Uri? = delegate?.uri
+
+                override fun getResponseHeaders(): MutableMap<String, MutableList<String>> {
+                    return delegate?.responseHeaders ?: mutableMapOf()
+                }
+
+                override fun close() {
+                    try {
+                        delegate?.close()
+                    } finally {
+                        delegate = null
+                    }
+                }
+            }
+        }
+
         val loadControl = androidx.media3.exoplayer.DefaultLoadControl.Builder()
             .setBufferDurationsMs(
                 15000, // minBufferMs
@@ -470,7 +489,7 @@ fun PlayerScreen(
         }
 
         val mediaSourceFactory = androidx.media3.exoplayer.source.DefaultMediaSourceFactory(
-            cacheDataSourceFactory,
+            routingDataSourceFactory,
             extractorsFactory
         )
 
@@ -580,9 +599,10 @@ fun PlayerScreen(
         player.prepare()
         exoPlayer = player
 
-        // Listen for track ending, video size changes, and tracks changed to select CC
+        // Listen for track ending, buffering, errors, video size changes, and tracks changed
         val listener = object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
+                isBuffering = (state == Player.STATE_BUFFERING)
                 if (state == Player.STATE_ENDED) {
                     if (currentAutoplayEnabled.value && currentNextEpisode.value != null) {
                         scope.launch {
@@ -590,6 +610,22 @@ fun PlayerScreen(
                         }
                     }
                 }
+            }
+
+            override fun onPlayerError(error: PlaybackException) {
+                isBuffering = false
+                val causeMsg = error.cause?.localizedMessage ?: error.localizedMessage ?: "Unknown playback error"
+                playbackErrorMessage = when {
+                    causeMsg.contains("401") || causeMsg.contains("403") ->
+                        "Authentication failed ($causeMsg). Check your network storage username/password or token."
+                    causeMsg.contains("404") ->
+                        "Media file not found on the network server (404). Try re-syncing the storage source."
+                    finalStreamUrl.startsWith("smb://", ignoreCase = true) ->
+                        "SMB network stream error: $causeMsg. Ensure you are on the same Wi-Fi/LAN and share permissions allow reading."
+                    else ->
+                        "Playback failed: $causeMsg"
+                }
+                android.util.Log.e("PlayerScreen", "ExoPlayer error for $finalStreamUrl", error)
             }
 
             override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
@@ -828,22 +864,97 @@ fun PlayerScreen(
             }
         }
 
-        if (isResolvingUrl || exoPlayer == null) {
+        if (isResolvingUrl || exoPlayer == null || isBuffering) {
+            if (playbackErrorMessage == null) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(if (isBuffering && exoPlayer != null) Color.Black.copy(alpha = 0.35f) else Color.Black),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        CircularProgressIndicator(color = Color(0xFF00E5FF))
+                        Spacer(modifier = Modifier.height(14.dp))
+                        Text(
+                            text = when {
+                                isResolvingUrl && item.id.startsWith("gdrive_") -> "Resolving Google Drive stream..."
+                                isResolvingUrl -> "Connecting to stream..."
+                                isBuffering && item.filePath.startsWith("smb://", ignoreCase = true) -> "Buffering SMB network stream..."
+                                isBuffering -> "Buffering stream..."
+                                else -> "Preparing media engine..."
+                            },
+                            color = Color.LightGray,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+            }
+        }
+
+        if (playbackErrorMessage != null) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color.Black),
+                    .background(Color.Black.copy(alpha = 0.88f))
+                    .padding(24.dp),
                 contentAlignment = Alignment.Center
             ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    CircularProgressIndicator(color = Color(0xFF00E5FF))
-                    Spacer(modifier = Modifier.height(16.dp))
-                    Text(
-                        text = if (isResolvingUrl) "Resolving Google Drive stream..." else "Preparing media engine...",
-                        color = Color.LightGray,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Medium
-                    )
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF141420)),
+                    shape = RoundedCornerShape(18.dp),
+                    border = BorderStroke(1.dp, Color(0xFFFF5252).copy(alpha = 0.5f)),
+                    modifier = Modifier.widthIn(max = 440.dp)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(20.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.ErrorOutline,
+                            contentDescription = "Playback Error",
+                            tint = Color(0xFFFF5252),
+                            modifier = Modifier.size(40.dp)
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Text(
+                            text = "Stream Playback Failed",
+                            color = Color.White,
+                            fontSize = 17.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = playbackErrorMessage ?: "",
+                            color = Color.LightGray,
+                            fontSize = 12.sp,
+                            lineHeight = 17.sp,
+                            textAlign = TextAlign.Center
+                        )
+                        Spacer(modifier = Modifier.height(18.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            OutlinedButton(
+                                onClick = onBack,
+                                modifier = Modifier.weight(1f).height(46.dp),
+                                border = BorderStroke(1.dp, Color.Gray.copy(alpha = 0.5f))
+                            ) {
+                                Text("Go Back", color = Color.LightGray)
+                            }
+                            Button(
+                                onClick = {
+                                    playbackErrorMessage = null
+                                    playerRetryNonce++
+                                },
+                                modifier = Modifier.weight(1f).height(46.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E5FF))
+                            ) {
+                                Text("Retry", color = Color.Black, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
                 }
             }
         }

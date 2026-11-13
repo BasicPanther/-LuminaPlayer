@@ -47,6 +47,15 @@ interface MediaDao {
     @Delete
     suspend fun deleteMediaItem(item: MediaItem)
 
+    @Query("SELECT filePath FROM media_items")
+    suspend fun getAllFilePaths(): List<String>
+
+    @Query("DELETE FROM media_items WHERE filePath IN (:paths)")
+    suspend fun deleteByFilePaths(paths: List<String>)
+
+    @Query("DELETE FROM media_items WHERE folderPath = :folderPath")
+    suspend fun deleteMediaByFolder(folderPath: String)
+
     @Query("DELETE FROM media_items")
     suspend fun clearAllMedia()
 

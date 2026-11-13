@@ -96,6 +96,106 @@ object MetadataService {
         "https://images.unsplash.com/photo-1518173946687-a4c8a383392c?q=80&w=800"  // Rain in forest
     )
 
+    @Volatile
+    var activeGeminiApiKey: String = ""
+
+    fun resolveGeminiApiKey(overrideKey: String? = null): String {
+        val candidate = when {
+            !overrideKey.isNullOrBlank() && overrideKey != "MY_GEMINI_API_KEY" -> overrideKey.trim()
+            activeGeminiApiKey.isNotBlank() && activeGeminiApiKey != "MY_GEMINI_API_KEY" -> activeGeminiApiKey.trim()
+            com.example.BuildConfig.GEMINI_API_KEY.isNotBlank() && com.example.BuildConfig.GEMINI_API_KEY != "MY_GEMINI_API_KEY" ->
+                com.example.BuildConfig.GEMINI_API_KEY.trim()
+            else -> ""
+        }
+        return candidate
+    }
+
+    suspend fun verifyGeminiApiKey(key: String): Result<String> = withContext(Dispatchers.IO) {
+        val cleanKey = key.trim()
+        if (cleanKey.isBlank()) return@withContext Result.failure(IllegalArgumentException("Please enter a Gemini API key."))
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$cleanKey"
+        val requestJson = JSONObject().apply {
+            put("contents", JSONArray().put(
+                JSONObject().put("parts", JSONArray().put(
+                    JSONObject().put("text", "Reply with OK")
+                ))
+            ))
+        }
+        val client = OkHttpClient.Builder()
+            .connectTimeout(12, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(12, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+        val request = Request.Builder()
+            .url(url)
+            .post(requestJson.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        try {
+            val start = System.currentTimeMillis()
+            client.newCall(request).execute().use { resp ->
+                val elapsed = System.currentTimeMillis() - start
+                val body = resp.body?.string() ?: ""
+                if (resp.isSuccessful) {
+                    Result.success("Verified! Gemini AI responded in ${elapsed}ms.")
+                } else {
+                    val errMsg = try {
+                        JSONObject(body).optJSONObject("error")?.optString("message")
+                    } catch (_: Exception) { null }
+                    Result.failure(Exception(errMsg ?: "HTTP ${resp.code}: Key rejected by Gemini API"))
+                }
+            }
+        } catch (e: Exception) {
+            Result.failure(Exception("Network error: ${e.localizedMessage ?: "Check internet connection"}"))
+        }
+    }
+
+    suspend fun verifyTmdbApiKey(key: String): Result<String> = withContext(Dispatchers.IO) {
+        val cleanKey = key.trim()
+        if (cleanKey.isBlank()) return@withContext Result.failure(IllegalArgumentException("Please enter a TMDB API key."))
+        val client = OkHttpClient.Builder()
+            .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+        val request = Request.Builder()
+            .url("https://api.themoviedb.org/3/configuration?api_key=$cleanKey")
+            .build()
+        try {
+            client.newCall(request).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    Result.success("Verified! TMDB v3 API key is active.")
+                } else {
+                    Result.failure(Exception("TMDB returned HTTP ${resp.code}: Check that you pasted the v3 API Key (not Read Access Token)."))
+                }
+            }
+        } catch (e: Exception) {
+            Result.failure(Exception("Network error: ${e.localizedMessage}"))
+        }
+    }
+
+    suspend fun verifyOmdbApiKey(key: String): Result<String> = withContext(Dispatchers.IO) {
+        val cleanKey = key.trim()
+        if (cleanKey.isBlank()) return@withContext Result.failure(IllegalArgumentException("Please enter an OMDB API key."))
+        val client = OkHttpClient.Builder()
+            .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+        val request = Request.Builder()
+            .url("https://www.omdbapi.com/?t=Inception&apikey=$cleanKey")
+            .build()
+        try {
+            client.newCall(request).execute().use { resp ->
+                val body = resp.body?.string() ?: ""
+                if (resp.isSuccessful && body.contains("\"Response\":\"True\"")) {
+                    Result.success("Verified! OMDB API key is active.")
+                } else {
+                    val err = try { JSONObject(body).optString("Error") } catch (_: Exception) { "" }
+                    Result.failure(Exception(err.ifBlank { "OMDB returned HTTP ${resp.code}" }))
+                }
+            }
+        } catch (e: Exception) {
+            Result.failure(Exception("Network error: ${e.localizedMessage}"))
+        }
+    }
+
     val api: TmdbApi by lazy {
         val retrofit = Retrofit.Builder()
             .baseUrl("https://api.themoviedb.org/3/")
@@ -118,8 +218,8 @@ object MetadataService {
     suspend fun searchTmdb(apiKey: String, query: String, type: String): List<UnifiedTmdbResult> {
         if (apiKey.isBlank() || apiKey == "MY_TMDB_API_KEY") {
             // Try to use Gemini to search!
-            val gApiKey = com.example.BuildConfig.GEMINI_API_KEY
-            if (gApiKey.isNotBlank() && gApiKey != "MY_GEMINI_API_KEY") {
+            val gApiKey = resolveGeminiApiKey()
+            if (gApiKey.isNotBlank()) {
                 val geminiResults = searchWithGemini(query, type)
                 if (geminiResults.isNotEmpty()) return geminiResults
             }
@@ -629,13 +729,13 @@ object MetadataService {
     }
 
     suspend fun searchWithGemini(query: String, type: String): List<UnifiedTmdbResult> = withContext(Dispatchers.IO) {
-        val gApiKey = com.example.BuildConfig.GEMINI_API_KEY
-        if (gApiKey.isBlank() || gApiKey == "MY_GEMINI_API_KEY") {
+        val gApiKey = resolveGeminiApiKey()
+        if (gApiKey.isBlank()) {
             Log.e(TAG, "Gemini API key is blank/missing")
             return@withContext emptyList()
         }
 
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=$gApiKey"
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$gApiKey"
 
         val prompt = """
             Search for 1 to 3 best matching ${if (type == "MOVIE") "movies" else "TV shows"} for the query "$query".
@@ -719,12 +819,12 @@ object MetadataService {
         folderPath: String,
         id: String
     ): MediaItem? = withContext(Dispatchers.IO) {
-        val gApiKey = com.example.BuildConfig.GEMINI_API_KEY
-        if (gApiKey.isBlank() || gApiKey == "MY_GEMINI_API_KEY") {
+        val gApiKey = resolveGeminiApiKey()
+        if (gApiKey.isBlank()) {
             return@withContext null
         }
 
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=$gApiKey"
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$gApiKey"
 
         val prompt = """
             Identify the movie or TV show episode from this filename: "$fileName".
@@ -823,12 +923,12 @@ object MetadataService {
     }
 
     suspend fun fetchByIdFromGemini(tmdbId: Int, type: String): UnifiedTmdbResult? = withContext(Dispatchers.IO) {
-        val gApiKey = com.example.BuildConfig.GEMINI_API_KEY
-        if (gApiKey.isBlank() || gApiKey == "MY_GEMINI_API_KEY") {
+        val gApiKey = resolveGeminiApiKey()
+        if (gApiKey.isBlank()) {
             return@withContext null
         }
 
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=$gApiKey"
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$gApiKey"
 
         val prompt = """
             Fetch detailed metadata for the TMDB ID $tmdbId of type "$type".
@@ -1090,8 +1190,8 @@ object MetadataService {
         }
 
         if (isRandom) {
-            val gApiKey = com.example.BuildConfig.GEMINI_API_KEY
-            if (gApiKey.isNotBlank() && gApiKey != "MY_GEMINI_API_KEY") {
+            val gApiKey = resolveGeminiApiKey()
+            if (gApiKey.isNotBlank()) {
                 return fetchFromGemini(fileName, filePath, folderPath, id)
                     ?: getFallbackMetadata(defaultParsed, filePath, fileName, folderPath, id)
             }
@@ -1100,8 +1200,8 @@ object MetadataService {
 
         if (apiKey.isNullOrBlank()) {
             // Apply high-fidelity Gemini auto-matching if configured
-            val gApiKey = com.example.BuildConfig.GEMINI_API_KEY
-            if (gApiKey.isNotBlank() && gApiKey != "MY_GEMINI_API_KEY") {
+            val gApiKey = resolveGeminiApiKey()
+            if (gApiKey.isNotBlank()) {
                 val gem = fetchFromGemini(fileName, filePath, folderPath, id)
                 if (gem != null) return gem
             }

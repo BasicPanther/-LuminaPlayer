@@ -4,25 +4,32 @@ import android.content.Context
 import android.util.Log
 import com.example.data.database.MediaDao
 import com.example.data.model.CloudSource
-import com.example.data.model.PlaybackHistory
+import com.example.data.model.MediaItem
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import okhttp3.Credentials
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import java.io.File
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
 import org.json.JSONObject
-import okhttp3.Credentials
+import java.net.URI
+import java.net.URLDecoder
+import java.net.URLEncoder
+import java.util.Stack
+import java.util.concurrent.TimeUnit
 
 object CloudSyncService {
     private const val TAG = "CloudSyncService"
-    private val client = getUnsafeOkHttpClient()
+    private val VIDEO_EXTENSIONS = listOf(".mp4", ".mkv", ".avi", ".webm", ".mov", ".m4v", ".ts", ".flv", ".wmv")
+    val client: OkHttpClient by lazy { getUnsafeOkHttpClient() }
 
-    private fun getUnsafeOkHttpClient(): OkHttpClient {
+    fun getUnsafeOkHttpClient(): OkHttpClient {
         return try {
             val trustAllCerts = arrayOf<javax.net.ssl.TrustManager>(
                 object : javax.net.ssl.X509TrustManager {
@@ -37,15 +44,120 @@ object CloudSyncService {
             OkHttpClient.Builder()
                 .sslSocketFactory(sslSocketFactory, trustAllCerts[0] as javax.net.ssl.X509TrustManager)
                 .hostnameVerifier { _, _ -> true }
-                .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
-                .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+                .followRedirects(true)
+                .followSslRedirects(true)
+                .connectTimeout(15, TimeUnit.SECONDS)
+                .readTimeout(25, TimeUnit.SECONDS)
                 .build()
         } catch (e: Exception) {
             OkHttpClient()
         }
     }
 
-    // Simulate standard cloud sync behavior, resolving history updates
+    /**
+     * Extracts URL-encoded Basic Auth credentials from a URL like http://user:pass@host/path
+     * returning Pair(cleanUrlWithoutCreds, authHeaderOrNull).
+     */
+    fun extractUrlAndAuth(rawUrl: String): Pair<String, String?> {
+        if (!rawUrl.startsWith("http://", ignoreCase = true) && !rawUrl.startsWith("https://", ignoreCase = true)) {
+            return rawUrl to null
+        }
+        val schemeIdx = rawUrl.indexOf("://")
+        if (schemeIdx == -1) return rawUrl to null
+        val scheme = rawUrl.substring(0, schemeIdx + 3)
+        val afterScheme = rawUrl.substring(schemeIdx + 3)
+        val slashIdx = afterScheme.indexOf('/')
+        val authority = if (slashIdx != -1) afterScheme.substring(0, slashIdx) else afterScheme
+        val pathPart = if (slashIdx != -1) afterScheme.substring(slashIdx) else ""
+
+        val atIdx = authority.lastIndexOf('@')
+        if (atIdx == -1) return rawUrl to null
+
+        val creds = authority.substring(0, atIdx)
+        val hostPort = authority.substring(atIdx + 1)
+        val colonIdx = creds.indexOf(':')
+        val username = try {
+            URLDecoder.decode(if (colonIdx != -1) creds.substring(0, colonIdx) else creds, "UTF-8")
+        } catch (_: Exception) {
+            if (colonIdx != -1) creds.substring(0, colonIdx) else creds
+        }
+        val password = try {
+            URLDecoder.decode(if (colonIdx != -1) creds.substring(colonIdx + 1) else "", "UTF-8")
+        } catch (_: Exception) {
+            if (colonIdx != -1) creds.substring(colonIdx + 1) else ""
+        }
+
+        val cleanUrl = "$scheme$hostPort$pathPart"
+        val authHeader = if (username.isNotBlank()) Credentials.basic(username, password) else null
+        return cleanUrl to authHeader
+    }
+
+    fun buildAuthenticatedHttpUrl(baseUrl: String, username: String, password: String): String {
+        val trimmed = baseUrl.trim()
+        val withScheme = if (!trimmed.startsWith("http://", ignoreCase = true) && !trimmed.startsWith("https://", ignoreCase = true)) {
+            "http://$trimmed"
+        } else {
+            trimmed
+        }
+        val (cleanUrl, _) = extractUrlAndAuth(withScheme)
+        if (username.isBlank()) return cleanUrl
+        val scheme = if (cleanUrl.startsWith("https://", ignoreCase = true)) "https://" else "http://"
+        val hostAndPath = cleanUrl.removePrefix("https://").removePrefix("http://")
+        val encUser = URLEncoder.encode(username.trim(), "UTF-8")
+        val encPass = URLEncoder.encode(password, "UTF-8")
+        val authPart = if (password.isNotEmpty()) "$encUser:$encPass@" else "$encUser@"
+        return "$scheme$authPart$hostAndPath"
+    }
+
+    suspend fun testWebDavOrHttpConnection(assembledUrl: String): Result<String> = withContext(Dispatchers.IO) {
+        val (cleanUrl, authHeader) = extractUrlAndAuth(assembledUrl)
+        try {
+            // Try WebDAV PROPFIND first
+            val bodyXml = """
+                <?xml version="1.0" encoding="utf-8" ?>
+                <D:propfind xmlns:D="DAV:">
+                  <D:prop>
+                    <D:displayname/>
+                    <D:resourcetype/>
+                  </D:prop>
+                </D:propfind>
+            """.trimIndent()
+            val propfindReq = Request.Builder()
+                .url(cleanUrl)
+                .method("PROPFIND", bodyXml.toRequestBody("text/xml; charset=utf-8".toMediaType()))
+                .header("Depth", "1")
+                .apply { if (authHeader != null) header("Authorization", authHeader) }
+                .build()
+
+            client.newCall(propfindReq).execute().use { resp ->
+                if (resp.isSuccessful || resp.code == 207) {
+                    return@withContext Result.success("WebDAV connected (HTTP ${resp.code})")
+                }
+                if (resp.code == 401 || resp.code == 403) {
+                    return@withContext Result.failure(Exception("Authentication failed (HTTP ${resp.code}). Check username & password."))
+                }
+            }
+
+            // Fallback to GET / HEAD for plain HTTP file servers
+            val getReq = Request.Builder()
+                .url(cleanUrl)
+                .apply { if (authHeader != null) header("Authorization", authHeader) }
+                .build()
+            client.newCall(getReq).execute().use { resp ->
+                when {
+                    resp.isSuccessful -> Result.success("HTTP server reachable (HTTP ${resp.code})")
+                    resp.code == 401 || resp.code == 403 ->
+                        Result.failure(Exception("Authentication failed (HTTP ${resp.code}). Check credentials."))
+                    else ->
+                        Result.failure(Exception("Server responded with HTTP ${resp.code} at $cleanUrl"))
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Connection test failed for $cleanUrl", e)
+            Result.failure(Exception("Cannot reach server: ${e.localizedMessage ?: e.javaClass.simpleName}"))
+        }
+    }
+
     suspend fun syncWithCloud(
         context: Context,
         source: CloudSource,
@@ -54,69 +166,399 @@ object CloudSyncService {
         omdbApiKey: String? = null,
         onProgress: (String) -> Unit = {}
     ): Boolean = withContext(Dispatchers.IO) {
-        onProgress("Establishing connection to ${source.name}...")
-        delay(1200) // Realistic network handshake
+        onProgress("Connecting to ${source.name}...")
 
-        if (source.type == "GOOGLE_DRIVE") {
-            val urlStr = source.serverUrl ?: ""
-            val token = source.accessToken
-            val folderId = extractGoogleDriveFolderId(urlStr)
-            val fileId = extractGoogleDriveFileId(urlStr)
+        when (source.type) {
+            "SMB" -> {
+                return@withContext try {
+                    val total = SmbNetworkService.scanSmbShare(
+                        source = source,
+                        mediaDao = mediaDao,
+                        tmdbApiKey = tmdbApiKey,
+                        omdbApiKey = omdbApiKey,
+                        onProgress = onProgress
+                    )
+                    syncPlaybackHistories(mediaDao)
+                    mediaDao.insertCloudSource(source.copy(isConnected = true, lastSynced = System.currentTimeMillis()))
+                    onProgress(
+                        if (total > 0) "SMB sync complete: $total video(s) ready to stream!"
+                        else "Connected to ${source.name}, no video files found in share."
+                    )
+                    true
+                } catch (e: Exception) {
+                    Log.e(TAG, "SMB sync error", e)
+                    onProgress("SMB error: ${e.localizedMessage ?: "Connection failed"}")
+                    false
+                }
+            }
 
-            if (folderId != null) {
-                onProgress("Connecting to Google Drive folder: $folderId")
-                delay(800)
-                
-                val folderQueue = java.util.Stack<String>()
-                folderQueue.push(folderId)
-                var count = 0
-                val videoExtensions = listOf(".mp4", ".mkv", ".avi", ".webm", ".mov", ".m4v", ".mp3")
-                var hadAuthError = false
+            "DIRECT_URL" -> {
+                return@withContext try {
+                    val streamUrl = source.serverUrl?.trim()
+                        ?: throw IllegalArgumentException("Stream URL is empty")
+                    val rawFileName = try {
+                        URLDecoder.decode(URI(streamUrl).path.substringAfterLast('/'), "UTF-8")
+                            .ifBlank { "${source.name}.mp4" }
+                    } catch (_: Exception) {
+                        "${source.name}.mp4"
+                    }
+                    val item = MetadataService.fetchMetadata(
+                        fileName = rawFileName,
+                        filePath = streamUrl,
+                        folderPath = source.name,
+                        apiKey = tmdbApiKey,
+                        omdbApiKey = omdbApiKey
+                    ).copy(id = "webdav_${streamUrl.hashCode()}")
+                    mediaDao.insertMediaItem(item)
+                    mediaDao.insertCloudSource(source.copy(isConnected = true, lastSynced = System.currentTimeMillis()))
+                    onProgress("Added stream '${item.title}' ready to play!")
+                    true
+                } catch (e: Exception) {
+                    Log.e(TAG, "Direct URL sync error", e)
+                    onProgress("Failed to add stream URL: ${e.localizedMessage}")
+                    false
+                }
+            }
+
+            "GOOGLE_DRIVE" -> {
+                return@withContext syncGoogleDrive(source, mediaDao, tmdbApiKey, omdbApiKey, onProgress)
+            }
+
+            else -> {
+                // TRUENAS / WEBDAV / HTTP_DIR
+                return@withContext syncWebDavOrHttp(source, mediaDao, tmdbApiKey, omdbApiKey, onProgress)
+            }
+        }
+    }
+
+    private suspend fun syncWebDavOrHttp(
+        source: CloudSource,
+        mediaDao: MediaDao,
+        tmdbApiKey: String?,
+        omdbApiKey: String?,
+        onProgress: (String) -> Unit
+    ): Boolean {
+        val rawUrl = source.serverUrl?.trim() ?: ""
+        if (rawUrl.isBlank()) {
+            onProgress("Server URL is empty.")
+            return false
+        }
+
+        val (cleanRootUrl, authHeader) = extractUrlAndAuth(rawUrl)
+        val credsPrefix = if (rawUrl.contains("@") && rawUrl.contains("://")) {
+            val schemeEnd = rawUrl.indexOf("://") + 3
+            val afterScheme = rawUrl.substring(schemeEnd)
+            val atIdx = afterScheme.substringBefore("/").lastIndexOf('@')
+            if (atIdx != -1) afterScheme.substring(0, atIdx + 1) else ""
+        } else {
+            ""
+        }
+
+        val existingPaths = mediaDao.getAllFilePaths().toHashSet()
+        val folderQueue = Stack<String>()
+        folderQueue.push(cleanRootUrl)
+        val scannedNormalizedPaths = mutableSetOf<String>()
+        val discovered = mutableListOf<Pair<String, String>>() // playUrl to decodedFileName
+        var authError = false
+        var lastErrorMsg: String? = null
+
+        fun normalizeForCompare(urlStr: String): String {
+            return try {
+                val u = URI(urlStr)
+                val decPath = URLDecoder.decode(u.path ?: "/", "UTF-8").trimEnd('/')
+                "${u.scheme?.lowercase()}://${u.authority?.lowercase()}$decPath"
+            } catch (_: Exception) {
+                urlStr.trimEnd('/').lowercase()
+            }
+        }
+
+        try {
+            while (folderQueue.isNotEmpty()) {
+                val currentUrl = folderQueue.pop()
+                val normCurrent = normalizeForCompare(currentUrl)
+                if (!scannedNormalizedPaths.add(normCurrent)) continue
+
+                val relativePath = try {
+                    URLDecoder.decode(URI(currentUrl).path ?: "/", "UTF-8")
+                } catch (_: Exception) {
+                    currentUrl.substringAfter("://").substringAfter("/", "/")
+                }
+                onProgress("Scanning ${source.name}: $relativePath")
+
+                val bodyXml = """
+                    <?xml version="1.0" encoding="utf-8" ?>
+                    <D:propfind xmlns:D="DAV:">
+                      <D:prop>
+                        <D:displayname/>
+                        <D:resourcetype/>
+                      </D:prop>
+                    </D:propfind>
+                """.trimIndent()
+
+                val reqBuilder = Request.Builder()
+                    .url(currentUrl)
+                    .method("PROPFIND", bodyXml.toRequestBody("text/xml; charset=utf-8".toMediaType()))
+                    .header("Depth", "1")
+                if (authHeader != null) reqBuilder.header("Authorization", authHeader)
+
+                var isWebdav = false
+                var responseBody: String? = null
 
                 try {
-                    while (!folderQueue.isEmpty()) {
-                        val currentFolderId = folderQueue.pop()
-                        onProgress("Scanning Drive folder: $currentFolderId")
-                        
-                        val builder = Request.Builder()
-                        val q = "'$currentFolderId' in parents and trashed = false"
-                        val encodedQ = java.net.URLEncoder.encode(q, "UTF-8")
-                        var url = "https://www.googleapis.com/drive/v3/files?q=$encodedQ&fields=files(id,name,mimeType,size)&pageSize=1000"
-                        if (!token.isNullOrBlank()) {
-                            if (token.startsWith("ya29.") || token.contains("Bearer")) {
-                                val authHeader = if (token.startsWith("Bearer ")) token else "Bearer $token"
-                                builder.header("Authorization", authHeader)
-                            } else {
-                                url += "&key=$token"
+                    client.newCall(reqBuilder.build()).execute().use { resp ->
+                        if (resp.code == 401 || resp.code == 403) {
+                            authError = true
+                            lastErrorMsg = "HTTP ${resp.code} Unauthorized"
+                        } else if (resp.isSuccessful || resp.code == 207) {
+                            val contentType = resp.header("Content-Type") ?: ""
+                            val bodyText = resp.body?.string()
+                            if (resp.code == 207 || contentType.contains("xml", ignoreCase = true) ||
+                                (bodyText?.contains("<multistatus", ignoreCase = true) == true) ||
+                                (bodyText?.contains(":multistatus", ignoreCase = true) == true)
+                            ) {
+                                isWebdav = true
+                                responseBody = bodyText
                             }
                         }
-                        builder.url(url)
-                        
-                        client.newCall(builder.build()).execute().use { response ->
-                            if (response.isSuccessful) {
-                                val bodyStr = response.body?.string()
-                                if (!bodyStr.isNullOrBlank()) {
-                                    val json = org.json.JSONObject(bodyStr)
-                                    val filesArr = json.optJSONArray("files")
-                                    if (filesArr != null && filesArr.length() > 0) {
-                                        for (i in 0 until filesArr.length()) {
-                                            val f = filesArr.getJSONObject(i)
-                                            val mimeType = f.optString("mimeType", "")
-                                            val fId = f.getString("id")
-                                            val fName = f.getString("name")
-                                            
-                                            if (mimeType == "application/vnd.google-apps.folder") {
-                                                // Found subfolder - push to stack for recursive indexing
-                                                folderQueue.push(fId)
-                                            } else if (mimeType.startsWith("video/") || mimeType.startsWith("audio/") || 
-                                                videoExtensions.any { fName.lowercase().endsWith(it) }
-                                            ) {
-                                                val streamUrl = if (!token.isNullOrBlank() && (token.startsWith("ya29.") || token.contains("Bearer"))) {
-                                                    "https://www.googleapis.com/drive/v3/files/$fId?alt=media"
-                                                } else {
-                                                    "https://drive.google.com/uc?export=download&id=$fId"
-                                                }
-                                                
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "PROPFIND attempt failed on $currentUrl: ${e.message}")
+                    lastErrorMsg = e.localizedMessage
+                }
+
+                if (authError) break
+
+                if (!isWebdav) {
+                    val getBuilder = Request.Builder().url(currentUrl)
+                    if (authHeader != null) getBuilder.header("Authorization", authHeader)
+                    try {
+                        client.newCall(getBuilder.build()).execute().use { resp ->
+                            if (resp.code == 401 || resp.code == 403) {
+                                authError = true
+                                lastErrorMsg = "HTTP ${resp.code} Unauthorized"
+                            } else if (resp.isSuccessful) {
+                                responseBody = resp.body?.string()
+                            } else {
+                                lastErrorMsg = "HTTP ${resp.code}"
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "GET failed for $currentUrl", e)
+                        lastErrorMsg = e.localizedMessage
+                    }
+                }
+
+                if (authError || responseBody.isNullOrBlank()) continue
+
+                if (isWebdav) {
+                    val responseRegex = "<(?:\\w+:)?response(\\s+[^>]*)?>(.*?)</(?:\\w+:)?response>".toRegex(setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
+                    val hrefRegex = "<(?:\\w+:)?href(\\s+[^>]*)?>(.*?)</(?:\\w+:)?href>".toRegex(RegexOption.IGNORE_CASE)
+
+                    for (match in responseRegex.findAll(responseBody!!)) {
+                        val block = match.groupValues[2]
+                        val rawHref = hrefRegex.find(block)?.groupValues?.get(2)?.trim() ?: continue
+
+                        val fullItemUrl = resolveHref(currentUrl, rawHref) ?: continue
+                        if (normalizeForCompare(fullItemUrl) == normCurrent) continue
+
+                        val isCollection = block.contains("<collection", ignoreCase = true) ||
+                            block.contains(":collection", ignoreCase = true) ||
+                            rawHref.endsWith("/")
+                        val fileNameRaw = rawHref.removeSuffix("/").substringAfterLast("/")
+                        val decodedFileName = try {
+                            URLDecoder.decode(fileNameRaw, "UTF-8")
+                        } catch (_: Exception) {
+                            fileNameRaw
+                        }
+                        if (decodedFileName.isBlank()) continue
+
+                        if (isCollection) {
+                            folderQueue.push(fullItemUrl)
+                        } else if (VIDEO_EXTENSIONS.any { decodedFileName.lowercase().endsWith(it) }) {
+                            val playUrl = injectCredentials(fullItemUrl, credsPrefix)
+                            discovered.add(playUrl to decodedFileName)
+                        }
+                    }
+                } else {
+                    val linkRegex = "<a\\s+[^>]*href\\s*=\\s*[\"']?([^\"'>\\s]+)[\"']?[^>]*>(.*?)</a>".toRegex(RegexOption.IGNORE_CASE)
+                    for (match in linkRegex.findAll(responseBody!!)) {
+                        val rawHref = match.groupValues[1].trim()
+                        if (rawHref.startsWith("?") || rawHref.startsWith("#") ||
+                            rawHref.startsWith("mailto:", ignoreCase = true) ||
+                            rawHref == "../" || rawHref == "./" || rawHref == ".." || rawHref == "."
+                        ) continue
+
+                        val fullItemUrl = resolveHref(currentUrl, rawHref) ?: continue
+                        val normItem = normalizeForCompare(fullItemUrl)
+                        if (normItem == normCurrent || !normItem.startsWith(normalizeForCompare(cleanRootUrl))) continue
+
+                        val isDirectory = rawHref.endsWith("/")
+                        val fileNameRaw = rawHref.removeSuffix("/").substringAfterLast("/")
+                        val decodedFileName = try {
+                            URLDecoder.decode(fileNameRaw, "UTF-8")
+                        } catch (_: Exception) {
+                            fileNameRaw
+                        }
+                        if (decodedFileName.isBlank()) continue
+
+                        if (isDirectory) {
+                            folderQueue.push(fullItemUrl)
+                        } else if (VIDEO_EXTENSIONS.any { decodedFileName.lowercase().endsWith(it) }) {
+                            val playUrl = injectCredentials(fullItemUrl, credsPrefix)
+                            discovered.add(playUrl to decodedFileName)
+                        }
+                    }
+                }
+                kotlinx.coroutines.yield()
+            }
+
+            if (authError) {
+                onProgress("Authentication failed ($lastErrorMsg). Verify username and password.")
+                return false
+            }
+
+            val newFiles = discovered.filter { (url, _) -> !existingPaths.contains(url) }
+            if (newFiles.isNotEmpty()) {
+                val semaphore = Semaphore(4)
+                coroutineScope {
+                    newFiles.forEachIndexed { idx, (playUrl, decodedFileName) ->
+                        launch {
+                            semaphore.withPermit {
+                                onProgress("Indexing [${idx + 1}/${newFiles.size}]: $decodedFileName")
+                                val itemId = "webdav_${playUrl.hashCode()}"
+                                val mItem = try {
+                                    MetadataService.fetchMetadata(
+                                        fileName = decodedFileName,
+                                        filePath = playUrl,
+                                        folderPath = source.name,
+                                        apiKey = tmdbApiKey,
+                                        omdbApiKey = omdbApiKey
+                                    ).copy(id = itemId)
+                                } catch (e: Exception) {
+                                    val parsed = MetadataService.parseFilename(decodedFileName)
+                                    MediaItem(
+                                        id = itemId,
+                                        filePath = playUrl,
+                                        fileName = decodedFileName,
+                                        title = if (parsed.type == "SHOW_EPISODE") "${parsed.cleanTitle} - S${parsed.season}E${parsed.episode}" else parsed.cleanTitle,
+                                        type = parsed.type,
+                                        showName = if (parsed.type == "SHOW_EPISODE") parsed.cleanTitle else null,
+                                        season = parsed.season,
+                                        episodeNumber = parsed.episode,
+                                        overview = "Network video streamed from ${source.name}.",
+                                        releaseDate = source.type,
+                                        rating = 7.5f,
+                                        posterUrl = MetadataService.CINEMATIC_STILLS[kotlin.math.abs(decodedFileName.hashCode()) % MetadataService.CINEMATIC_STILLS.size],
+                                        backdropUrl = MetadataService.CINEMATIC_STILLS[kotlin.math.abs(playUrl.hashCode()) % MetadataService.CINEMATIC_STILLS.size],
+                                        folderPath = source.name
+                                    )
+                                }
+                                mediaDao.insertMediaItem(mItem)
+                            }
+                        }
+                    }
+                }
+            }
+
+            syncPlaybackHistories(mediaDao)
+            mediaDao.insertCloudSource(source.copy(isConnected = true, lastSynced = System.currentTimeMillis()))
+
+            if (discovered.isEmpty()) {
+                val reason = if (lastErrorMsg != null) " ($lastErrorMsg)" else ""
+                onProgress("Connected, but no playable videos found$reason.")
+                return lastErrorMsg == null
+            }
+            onProgress("Synced ${discovered.size} video(s) (${newFiles.size} new) from ${source.name}!")
+            return true
+        } catch (e: Exception) {
+            Log.e(TAG, "WebDAV/HTTP sync error", e)
+            onProgress("Sync failed: ${e.localizedMessage ?: "Check server address"}")
+            return false
+        }
+    }
+
+    private fun resolveHref(currentUrl: String, rawHref: String): String? {
+        return try {
+            if (rawHref.startsWith("http://", ignoreCase = true) || rawHref.startsWith("https://", ignoreCase = true)) {
+                rawHref
+            } else {
+                val baseUri = URI(if (currentUrl.endsWith("/")) currentUrl else "$currentUrl/")
+                baseUri.resolve(rawHref).toString()
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun injectCredentials(fullUrl: String, credsPrefix: String): String {
+        if (credsPrefix.isBlank()) return fullUrl
+        val scheme = if (fullUrl.startsWith("https://", ignoreCase = true)) "https://" else "http://"
+        val cleanHost = fullUrl.removePrefix("https://").removePrefix("http://")
+        return "$scheme$credsPrefix$cleanHost"
+    }
+
+    private suspend fun syncGoogleDrive(
+        source: CloudSource,
+        mediaDao: MediaDao,
+        tmdbApiKey: String?,
+        omdbApiKey: String?,
+        onProgress: (String) -> Unit
+    ): Boolean {
+        val urlStr = source.serverUrl ?: ""
+        val token = source.accessToken
+        val folderId = extractGoogleDriveFolderId(urlStr)
+        val fileId = extractGoogleDriveFileId(urlStr)
+        val existingPaths = mediaDao.getAllFilePaths().toHashSet()
+
+        if (folderId != null) {
+            onProgress("Connecting to Google Drive folder...")
+            val folderQueue = Stack<String>()
+            folderQueue.push(folderId)
+            var count = 0
+            var hadAuthError = false
+
+            try {
+                while (folderQueue.isNotEmpty()) {
+                    val currentFolderId = folderQueue.pop()
+                    onProgress("Scanning Drive folder: $currentFolderId")
+                    val builder = Request.Builder()
+                    val q = "'$currentFolderId' in parents and trashed = false"
+                    val encodedQ = URLEncoder.encode(q, "UTF-8")
+                    var url = "https://www.googleapis.com/drive/v3/files?q=$encodedQ&fields=files(id,name,mimeType,size)&pageSize=1000"
+                    if (!token.isNullOrBlank()) {
+                        if (token.startsWith("ya29.") || token.contains("Bearer")) {
+                            val authHeader = if (token.startsWith("Bearer ")) token else "Bearer $token"
+                            builder.header("Authorization", authHeader)
+                        } else {
+                            url += "&key=$token"
+                        }
+                    }
+                    builder.url(url)
+
+                    client.newCall(builder.build()).execute().use { response ->
+                        if (response.isSuccessful) {
+                            val bodyStr = response.body?.string()
+                            if (!bodyStr.isNullOrBlank()) {
+                                val json = JSONObject(bodyStr)
+                                val filesArr = json.optJSONArray("files")
+                                if (filesArr != null) {
+                                    for (i in 0 until filesArr.length()) {
+                                        val f = filesArr.getJSONObject(i)
+                                        val mimeType = f.optString("mimeType", "")
+                                        val fId = f.getString("id")
+                                        val fName = f.getString("name")
+
+                                        if (mimeType == "application/vnd.google-apps.folder") {
+                                            folderQueue.push(fId)
+                                        } else if (mimeType.startsWith("video/") || mimeType.startsWith("audio/") ||
+                                            VIDEO_EXTENSIONS.any { fName.lowercase().endsWith(it) }
+                                        ) {
+                                            val streamUrl = if (!token.isNullOrBlank() && (token.startsWith("ya29.") || token.contains("Bearer"))) {
+                                                "https://www.googleapis.com/drive/v3/files/$fId?alt=media"
+                                            } else {
+                                                "https://drive.google.com/uc?export=download&id=$fId"
+                                            }
+                                            if (!existingPaths.contains(streamUrl)) {
                                                 val mItem = try {
                                                     MetadataService.fetchMetadata(
                                                         fileName = fName,
@@ -125,10 +567,9 @@ object CloudSyncService {
                                                         apiKey = tmdbApiKey,
                                                         omdbApiKey = omdbApiKey
                                                     ).copy(id = "gdrive_$fId")
-                                                } catch (e: Exception) {
-                                                    Log.e(TAG, "Failed to fetch metadata for Google Drive item $fName", e)
+                                                } catch (_: Exception) {
                                                     val parsed = MetadataService.parseFilename(fName)
-                                                    com.example.data.model.MediaItem(
+                                                    MediaItem(
                                                         id = "gdrive_$fId",
                                                         filePath = streamUrl,
                                                         fileName = fName,
@@ -137,374 +578,75 @@ object CloudSyncService {
                                                         showName = if (parsed.type == "SHOW_EPISODE") parsed.cleanTitle else null,
                                                         season = parsed.season,
                                                         episodeNumber = parsed.episode,
-                                                        overview = "Cloud streamed media file from Google Drive folder tree.",
+                                                        overview = "Streamed from Google Drive.",
                                                         releaseDate = "Google Drive",
-                                                        rating = 8.5f,
-                                                        posterUrl = "https://images.unsplash.com/photo-1574267431644-4ed22da99538?q=80&w=400",
-                                                        backdropUrl = "https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?q=80&w=1200",
+                                                        rating = 8.0f,
+                                                        posterUrl = MetadataService.CINEMATIC_STILLS[0],
+                                                        backdropUrl = MetadataService.CINEMATIC_STILLS[1],
                                                         folderPath = source.name
                                                     )
                                                 }
                                                 mediaDao.insertMediaItem(mItem)
-                                                count++
                                             }
+                                            count++
                                         }
                                     }
                                 }
-                            } else {
-                                if (response.code == 403) {
-                                    hadAuthError = true
-                                }
                             }
-                        }
-                        kotlinx.coroutines.yield()
-                        delay(40) // avoid hitting API limits
-                    }
-                    
-                    if (hadAuthError) {
-                        onProgress("Google Drive API Error 403: Forbidden folder access detected. Ensure shared link is public.")
-                        delay(4000)
-                    } else if (count > 0) {
-                        onProgress("Successfully indexed $count video files recursively from Google Drive!")
-                        delay(1500)
-                    } else {
-                        onProgress("No playable video files found in Google Drive folder tree.")
-                        delay(1500)
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Google Drive folder recursive sync error: ", e)
-                    onProgress("Unable to parse all nested folders. Sync finished with limitations.")
-                    delay(1500)
-                }
-            } else if (fileId != null) {
-                onProgress("Connecting to Google Drive file: $fileId")
-                delay(800)
-                val streamUrl = if (!token.isNullOrBlank() && (token.startsWith("ya29.") || token.contains("Bearer"))) {
-                    "https://www.googleapis.com/drive/v3/files/$fileId?alt=media"
-                } else {
-                    "https://drive.google.com/uc?export=download&id=$fileId"
-                }
-                val mItem = com.example.data.model.MediaItem(
-                    id = "gdrive_$fileId",
-                    filePath = streamUrl,
-                    fileName = "gdrive_file.mp4",
-                    title = "Google Drive Shared Video",
-                    type = "MOVIE",
-                    overview = "Direct shared video file streamed from Google Drive.",
-                    releaseDate = "Google Drive",
-                    rating = 9.0f,
-                    posterUrl = "https://images.unsplash.com/photo-1574267431644-4ed22da99538?q=80&w=400",
-                    backdropUrl = "https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?q=80&w=1200",
-                    folderPath = source.name
-                )
-                try {
-                    mediaDao.insertMediaItem(mItem)
-                    onProgress("Successfully linked Google Drive stream!")
-                    delay(1500)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Google Drive file save error: ", e)
-                    onProgress("Error saving file metadata. Sync failed.")
-                    delay(1500)
-                }
-            } else {
-                onProgress("No valid Google Drive URL or ID input. Sync failed.")
-                delay(1500)
-            }
-        } else if (source.type == "TRUENAS") {
-            val rawUrl = source.serverUrl ?: ""
-            onProgress("Connecting to TrueNAS server...")
-            delay(800)
-
-            var cleanUrl = rawUrl
-            var username = ""
-            var password = ""
-
-            if (rawUrl.contains("@")) {
-                try {
-                    val schemeIdx = rawUrl.indexOf("://")
-                    val scheme = if (schemeIdx != -1) rawUrl.substring(0, schemeIdx + 3) else ""
-                    val withoutScheme = if (schemeIdx != -1) rawUrl.substring(schemeIdx + 3) else rawUrl
-                    val atIdx = withoutScheme.indexOf("@")
-                    if (atIdx != -1) {
-                        val credentials = withoutScheme.substring(0, atIdx)
-                        val rest = withoutScheme.substring(atIdx + 1)
-                        val colonIdx = credentials.indexOf(":")
-                        if (colonIdx != -1) {
-                            username = credentials.substring(0, colonIdx)
-                            password = credentials.substring(colonIdx + 1)
-                        } else {
-                            username = credentials
-                        }
-                        cleanUrl = scheme + rest
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error parsing credentials from TrueNAS URL", e)
-                }
-            }
-
-            val authHeader = if (username.isNotEmpty()) {
-                Credentials.basic(username, password)
-            } else {
-                null
-            }
-
-            val folderQueue = java.util.Stack<String>()
-            folderQueue.push(cleanUrl)
-            var count = 0
-            val videoExtensions = listOf(".mp4", ".mkv", ".avi", ".webm", ".mov", ".m4v", ".mp3")
-            val scannedDirs = mutableSetOf<String>()
-
-            try {
-                while (!folderQueue.isEmpty()) {
-                    val currentUrl = folderQueue.pop()
-                    if (scannedDirs.contains(currentUrl)) continue
-                    scannedDirs.add(currentUrl)
-
-                    val relativePath = currentUrl.substringAfter("://").substringAfter("/", "")
-                    onProgress("Scanning TrueNAS: /$relativePath")
-
-                    // Try WebDAV PROPFIND
-                    val bodyXml = """
-                        <?xml version="1.0" encoding="utf-8" ?>
-                        <D:propfind xmlns:D="DAV:">
-                          <D:prop>
-                            <D:displayname/>
-                            <D:resourcetype/>
-                          </D:prop>
-                        </D:propfind>
-                    """.trimIndent()
-
-                    val reqBuilder = Request.Builder()
-                        .url(currentUrl)
-                        .method("PROPFIND", bodyXml.toRequestBody("text/xml; charset=utf-8".toMediaType()))
-                        .header("Depth", "1")
-                    if (authHeader != null) {
-                        reqBuilder.header("Authorization", authHeader)
-                    }
-
-                    var isWebdav = false
-                    var responseBody: String? = null
-
-                    try {
-                        client.newCall(reqBuilder.build()).execute().use { resp ->
-                            if (resp.isSuccessful) {
-                                val contentType = resp.header("Content-Type") ?: ""
-                                if (contentType.contains("xml", ignoreCase = true) || resp.code == 207) {
-                                    isWebdav = true
-                                    responseBody = resp.body?.string()
-                                }
-                            }
-                        }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "PROPFIND failed/unsupported, trying GET", e)
-                    }
-
-                    if (!isWebdav) {
-                        // Standard HTTP GET fallback
-                        val getBuilder = Request.Builder().url(currentUrl)
-                        if (authHeader != null) {
-                            getBuilder.header("Authorization", authHeader)
-                        }
-                        try {
-                            client.newCall(getBuilder.build()).execute().use { resp ->
-                                if (resp.isSuccessful) {
-                                    responseBody = resp.body?.string()
-                                }
-                            }
-                        } catch (e: Exception) {
-                            Log.e(TAG, "GET failed for $currentUrl", e)
+                        } else if (response.code == 403 || response.code == 401) {
+                            hadAuthError = true
                         }
                     }
-
-                    if (responseBody.isNullOrBlank()) continue
-
-                    if (isWebdav) {
-                        val responseRegex = "<(?:\\w+:)?response(\\s+[^>]*)?>(.*?)</(?:\\w+:)?response>".toRegex(setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
-                        val hrefRegex = "<(?:\\w+:)?href(\\s+[^>]*)?>(.*?)</(?:\\w+:)?href>".toRegex(RegexOption.IGNORE_CASE)
-
-                        val matches = responseRegex.findAll(responseBody!!)
-                        for (match in matches) {
-                            val block = match.groupValues[2]
-                            val hrefMatch = hrefRegex.find(block) ?: continue
-                            val rawHref = hrefMatch.groupValues[2].trim()
-
-                            val fullItemUrl = if (rawHref.startsWith("http://") || rawHref.startsWith("https://")) {
-                                rawHref
-                            } else {
-                                val uri = java.net.URI(currentUrl)
-                                val base = "${uri.scheme}://${uri.authority}"
-                                if (rawHref.startsWith("/")) {
-                                    base + rawHref
-                                } else {
-                                    val basePath = uri.path.substringBeforeLast("/", "") + "/"
-                                    base + basePath + rawHref
-                                }
-                            }
-
-                            val cleanCurrent = currentUrl.removeSuffix("/")
-                            val cleanItem = fullItemUrl.removeSuffix("/")
-                            if (cleanCurrent.equals(cleanItem, ignoreCase = true)) continue
-
-                            val isCollection = block.contains("<collection", ignoreCase = true) || 
-                                               block.contains(":collection", ignoreCase = true) || 
-                                               rawHref.endsWith("/")
-                            val nameWithSlash = rawHref.removeSuffix("/")
-                            val fileName = nameWithSlash.substringAfterLast("/")
-                            
-                            val decodedFileName = try {
-                                java.net.URLDecoder.decode(fileName, "UTF-8")
-                            } catch (e: Exception) {
-                                fileName
-                            }
-
-                            if (isCollection) {
-                                folderQueue.push(fullItemUrl)
-                            } else if (videoExtensions.any { decodedFileName.lowercase().endsWith(it) }) {
-                                val playUrl = if (username.isNotEmpty()) {
-                                    val prefix = if (fullItemUrl.startsWith("https://")) "https://" else "http://"
-                                    val cleanHost = fullItemUrl.removePrefix("http://").removePrefix("https://")
-                                    "$prefix$username:$password@$cleanHost"
-                                } else {
-                                    fullItemUrl
-                                }
-
-                                val mItem = try {
-                                    MetadataService.fetchMetadata(
-                                        fileName = decodedFileName,
-                                        filePath = playUrl,
-                                        folderPath = source.name,
-                                        apiKey = tmdbApiKey,
-                                        omdbApiKey = omdbApiKey
-                                    ).copy(id = "truenas_${playUrl.hashCode()}")
-                                } catch (e: Exception) {
-                                    val parsed = MetadataService.parseFilename(decodedFileName)
-                                    com.example.data.model.MediaItem(
-                                        id = "truenas_${playUrl.hashCode()}",
-                                        filePath = playUrl,
-                                        fileName = decodedFileName,
-                                        title = if (parsed.type == "SHOW_EPISODE") "${parsed.cleanTitle} - S${parsed.season}E${parsed.episode}" else parsed.cleanTitle,
-                                        type = parsed.type,
-                                        showName = if (parsed.type == "SHOW_EPISODE") parsed.cleanTitle else null,
-                                        season = parsed.season,
-                                        episodeNumber = parsed.episode,
-                                        overview = "Network streamed file indexed recursively from TrueNAS share.",
-                                        releaseDate = "TrueNAS",
-                                        rating = 7.5f,
-                                        posterUrl = "https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?q=80&w=400",
-                                        backdropUrl = "https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?q=80&w=1200",
-                                        folderPath = source.name
-                                    )
-                                }
-                                mediaDao.insertMediaItem(mItem)
-                                count++
-                            }
-                        }
-                    } else {
-                        val linkRegex = "<a\\s+[^>]*href\\s*=\\s*[\"']?([^\"'>\\s]+)[\"']?[^>]*>(.*?)</a>".toRegex(RegexOption.IGNORE_CASE)
-                        val matches = linkRegex.findAll(responseBody!!)
-                        for (match in matches) {
-                            val rawHref = match.groupValues[1]
-
-                            if (rawHref.startsWith("?") || (rawHref.startsWith("/") && !rawHref.startsWith(java.net.URI(currentUrl).path)) || 
-                                rawHref.contains("mailto:") || (rawHref.contains("http://") && !rawHref.startsWith(currentUrl)) || 
-                                (rawHref.contains("https://") && !rawHref.startsWith(currentUrl)) || 
-                                rawHref == "../" || rawHref == "./"
-                            ) {
-                                continue
-                            }
-
-                            val fullItemUrl = if (rawHref.startsWith("http://") || rawHref.startsWith("https://")) {
-                                rawHref
-                            } else {
-                                currentUrl.removeSuffix("/") + "/" + rawHref
-                            }
-
-                            val isDirectory = rawHref.endsWith("/")
-                            val decodedFileName = try {
-                                java.net.URLDecoder.decode(rawHref.removeSuffix("/"), "UTF-8").substringAfterLast("/")
-                            } catch (e: Exception) {
-                                rawHref.removeSuffix("/").substringAfterLast("/")
-                            }
-
-                            if (decodedFileName.isBlank()) continue
-
-                            if (isDirectory) {
-                                folderQueue.push(fullItemUrl)
-                            } else if (videoExtensions.any { decodedFileName.lowercase().endsWith(it) }) {
-                                val playUrl = if (username.isNotEmpty()) {
-                                    val prefix = if (fullItemUrl.startsWith("https://")) "https://" else "http://"
-                                    val cleanHost = fullItemUrl.removePrefix("http://").removePrefix("https://")
-                                    "$prefix$username:$password@$cleanHost"
-                                } else {
-                                    fullItemUrl
-                                }
-
-                                val mItem = try {
-                                    MetadataService.fetchMetadata(
-                                        fileName = decodedFileName,
-                                        filePath = playUrl,
-                                        folderPath = source.name,
-                                        apiKey = tmdbApiKey,
-                                        omdbApiKey = omdbApiKey
-                                    ).copy(id = "truenas_${playUrl.hashCode()}")
-                                } catch (e: Exception) {
-                                    val parsed = MetadataService.parseFilename(decodedFileName)
-                                    com.example.data.model.MediaItem(
-                                        id = "truenas_${playUrl.hashCode()}",
-                                        filePath = playUrl,
-                                        fileName = decodedFileName,
-                                        title = if (parsed.type == "SHOW_EPISODE") "${parsed.cleanTitle} - S${parsed.season}E${parsed.episode}" else parsed.cleanTitle,
-                                        type = parsed.type,
-                                        showName = if (parsed.type == "SHOW_EPISODE") parsed.cleanTitle else null,
-                                        season = parsed.season,
-                                        episodeNumber = parsed.episode,
-                                        overview = "Network streamed file indexed recursively from TrueNAS share.",
-                                        releaseDate = "TrueNAS",
-                                        rating = 7.5f,
-                                        posterUrl = "https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?q=80&w=400",
-                                        backdropUrl = "https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?q=80&w=1200",
-                                        folderPath = source.name
-                                    )
-                                }
-                                mediaDao.insertMediaItem(mItem)
-                                count++
-                            }
-                        }
-                    }
-
                     kotlinx.coroutines.yield()
                 }
 
-                if (count > 0) {
-                    onProgress("Successfully indexed $count video files recursively from TrueNAS storage!")
-                    delay(1500)
+                syncPlaybackHistories(mediaDao)
+                mediaDao.insertCloudSource(source.copy(isConnected = true, lastSynced = System.currentTimeMillis()))
+
+                return if (hadAuthError) {
+                    onProgress("Google Drive Error 403: Ensure shared folder is public or provide an OAuth/API token.")
+                    false
                 } else {
-                    onProgress("No playable video files found in TrueNAS storage tree.")
-                    delay(1500)
+                    onProgress("Indexed $count video(s) from Google Drive!")
+                    true
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "TrueNAS recursive sync error: ", e)
-                onProgress("TrueNAS scanning finished with limitations.")
-                delay(1500)
+                Log.e(TAG, "Google Drive folder sync error", e)
+                onProgress("Google Drive sync error: ${e.localizedMessage}")
+                return false
             }
+        } else if (fileId != null) {
+            val streamUrl = if (!token.isNullOrBlank() && (token.startsWith("ya29.") || token.contains("Bearer"))) {
+                "https://www.googleapis.com/drive/v3/files/$fileId?alt=media"
+            } else {
+                "https://drive.google.com/uc?export=download&id=$fileId"
+            }
+            val mItem = MediaItem(
+                id = "gdrive_$fileId",
+                filePath = streamUrl,
+                fileName = "${source.name}.mp4",
+                title = source.name.ifBlank { "Google Drive Video" },
+                type = "MOVIE",
+                overview = "Direct video streamed from Google Drive.",
+                releaseDate = "Google Drive",
+                rating = 8.5f,
+                posterUrl = MetadataService.CINEMATIC_STILLS[0],
+                backdropUrl = MetadataService.CINEMATIC_STILLS[1],
+                folderPath = source.name
+            )
+            mediaDao.insertMediaItem(mItem)
+            mediaDao.insertCloudSource(source.copy(isConnected = true, lastSynced = System.currentTimeMillis()))
+            onProgress("Linked Google Drive video!")
+            return true
         } else {
-            // Google Drive / Dropbox API sync pipelines
-            onProgress("Authorizing ${source.type} credentials...")
-            delay(1000)
-            onProgress("Scanning remote library and syncing watch states...")
+            onProgress("Invalid Google Drive URL or ID.")
+            return false
         }
+    }
 
-        // Synchronize playback history
+    private suspend fun syncPlaybackHistories(mediaDao: MediaDao) {
         try {
-            val localItems = mediaDao.getAllMediaItems().first()
             val localHistories = mediaDao.getAllPlaybackHistory().first()
-            
-            onProgress("Merging remote and local watch history...")
-            delay(800)
-
-            // Perform bidirectional sync:
-            // 1. Send local watch positions to "Cloud"
-            // 2. Fetch new positions (for simulation, we'll shift positions slightly if synced to see updates)
             localHistories.forEach { history ->
                 val mediaItem = mediaDao.getMediaItemById(history.mediaId)
                 if (mediaItem != null && mediaItem.playbackPosition < history.playbackPosition) {
@@ -516,20 +658,11 @@ object CloudSyncService {
                     )
                 }
             }
-            
-            // Successfully synchronized
-            mediaDao.insertCloudSource(source.copy(isConnected = true, lastSynced = System.currentTimeMillis()))
-            onProgress("Library synchronized successfully!")
-            delay(500)
-            true
         } catch (e: Exception) {
-            Log.e(TAG, "Sync error: ", e)
-            onProgress("Sync failed: ${e.localizedMessage}")
-            false
+            Log.w(TAG, "History merge warning: ${e.message}")
         }
     }
 
-    // Connect a Google Drive, Dropbox or TrueNAS account
     suspend fun connectAccount(
         type: String,
         name: String,
@@ -537,7 +670,8 @@ object CloudSyncService {
         accessToken: String? = null,
         mediaDao: MediaDao
     ): CloudSource {
-        val id = "${type.lowercase()}_source"
+        val uniqueSuffix = (serverUrl ?: name).hashCode().toString()
+        val id = "${type.lowercase()}_$uniqueSuffix"
         val source = CloudSource(
             id = id,
             type = type,
@@ -553,30 +687,20 @@ object CloudSyncService {
 
     private fun extractGoogleDriveFolderId(url: String): String? {
         if (url.isBlank()) return null
-        val folderRegex = "folders/([a-zA-Z0-9-_]+)".toRegex()
-        val matchFolder = folderRegex.find(url)
+        val matchFolder = "folders/([a-zA-Z0-9-_]+)".toRegex().find(url)
         if (matchFolder != null) return matchFolder.groupValues[1]
-
-        val idRegex = "[?&]id=([a-zA-Z0-9-_]+)".toRegex()
-        val matchId = idRegex.find(url)
-        if (matchId != null) return matchId.groupValues[1]
-
-        if (!url.contains("/") && url.length > 15) {
-            return url.trim()
-        }
+        val matchId = "[?&]id=([a-zA-Z0-9-_]+)".toRegex().find(url)
+        if (matchId != null && url.contains("drive", ignoreCase = true) && !url.contains("/file/")) return matchId.groupValues[1]
+        if (!url.contains("/") && url.length > 15) return url.trim()
         return null
     }
 
     private fun extractGoogleDriveFileId(url: String): String? {
         if (url.isBlank()) return null
-        val fileRegex = "/d/([a-zA-Z0-9-_]+)".toRegex()
-        val matchFile = fileRegex.find(url)
+        val matchFile = "/d/([a-zA-Z0-9-_]+)".toRegex().find(url)
         if (matchFile != null) return matchFile.groupValues[1]
-        
-        val idRegex = "[?&]id=([a-zA-Z0-9-_]+)".toRegex()
-        val matchId = idRegex.find(url)
+        val matchId = "[?&]id=([a-zA-Z0-9-_]+)".toRegex().find(url)
         if (matchId != null) return matchId.groupValues[1]
-        
         return null
     }
 }

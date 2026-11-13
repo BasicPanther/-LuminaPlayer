@@ -59,6 +59,17 @@ android {
     buildConfig = true
   }
   testOptions { unitTests { isIncludeAndroidResources = true } }
+  packaging {
+    resources {
+      excludes += setOf(
+        "META-INF/DEPENDENCIES",
+        "META-INF/LICENSE*",
+        "META-INF/NOTICE*",
+        "META-INF/INDEX.LIST",
+        "META-INF/versions/9/OSGI-INF/MANIFEST.MF"
+      )
+    }
+  }
 }
 
 // Configure the Secrets Gradle Plugin to use .env and .env.example files
@@ -102,6 +113,8 @@ dependencies {
   implementation(libs.androidx.media3.exoplayer)
   implementation(libs.androidx.media3.ui)
   implementation(libs.androidx.media3.session)
+  implementation(libs.androidx.media3.datasource.okhttp)
+  implementation(libs.smbj)
   implementation(libs.converter.moshi)
   implementation(libs.firebase.ai)
   implementation(libs.firebase.appcheck.recaptcha)

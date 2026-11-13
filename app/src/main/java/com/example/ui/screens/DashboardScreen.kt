@@ -17,19 +17,23 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.border
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.automirrored.filled.HelpOutline
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.CloudQueue
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Movie
-import androidx.compose.material.icons.filled.Tv
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Star
-import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Tv
 import androidx.compose.material.icons.filled.Warning
-import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.ArrowDownward
-import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -105,6 +109,7 @@ fun DashboardScreen(
     viewModel: MediaViewModel,
     onMediaClick: (MediaItem) -> Unit,
     onNavigateToSettings: () -> Unit,
+    onNavigateToCloud: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -115,44 +120,45 @@ fun DashboardScreen(
 
     var searchQuery by remember { mutableStateOf("") }
     var selectedShowName by remember { mutableStateOf<String?>(null) }
-    
+
     var selectedMovieForFixMatch by remember { mutableStateOf<MediaItem?>(null) }
     var selectedShowForFixMatch by remember { mutableStateOf<TvShow?>(null) }
     val savedTmdbApiKey by viewModel.tmdbApiKey.collectAsStateWithLifecycle()
+    val savedGeminiApiKey by viewModel.geminiApiKey.collectAsStateWithLifecycle()
+    val tutorialCompleted by viewModel.tutorialCompleted.collectAsStateWithLifecycle()
 
-    val prefs = remember { context.getSharedPreferences("lumina_player_prefs", android.content.Context.MODE_PRIVATE) }
-    var showFirstTimePermissionPopup by remember {
-        mutableStateOf(prefs.getBoolean("is_first_time_use", true))
-    }
+    var showTutorialDialog by remember(tutorialCompleted) { mutableStateOf(!tutorialCompleted) }
+    var showApiWizardDialog by remember { mutableStateOf(false) }
+    var apiWizardStep by remember { mutableIntStateOf(0) }
 
     val permissionLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
         contract = androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions(),
         onResult = { permissions ->
             val granted = permissions.values.all { it }
             if (granted) {
-                viewModel.scanLocalMedia(context)
+                viewModel.scanNewMediaOnly(context, silent = false)
             } else {
                 android.widget.Toast.makeText(context, "Storage permissions are required to scan media.", android.widget.Toast.LENGTH_LONG).show()
             }
         }
     )
 
-    val onRequestPermission = {
+    val onRequestQuickScan = {
         val permissionsToRequest = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
             arrayOf(android.Manifest.permission.READ_MEDIA_VIDEO)
         } else {
             arrayOf(android.Manifest.permission.READ_EXTERNAL_STORAGE)
         }
-        
+
         val allGranted = permissionsToRequest.all { perm ->
             androidx.core.content.ContextCompat.checkSelfPermission(
                 context,
                 perm
             ) == android.content.pm.PackageManager.PERMISSION_GRANTED
         }
-        
+
         if (allGranted) {
-            viewModel.scanLocalMedia(context)
+            viewModel.scanNewMediaOnly(context, silent = false)
         } else {
             permissionLauncher.launch(permissionsToRequest)
         }
@@ -210,22 +216,31 @@ fun DashboardScreen(
     val localMediaOnly = remember(filteredMedia) {
         filteredMedia.filter { item ->
             val isDownloaded = (item.filePath.startsWith("/") && java.io.File(item.filePath).exists()) || viewModel.getDownloadedFile(context, item).exists()
-            isDownloaded || (
-                !item.id.startsWith("gdrive_") &&
-                !item.id.startsWith("nas_") &&
-                !item.id.startsWith("webdav_") &&
-                !item.filePath.startsWith("smb://") &&
-                !(item.filePath.startsWith("http") && !item.filePath.contains("google"))
-            )
+            val isNetworkOrCloud = item.id.startsWith("gdrive_") ||
+                item.id.startsWith("nas_") ||
+                item.id.startsWith("truenas_") ||
+                item.id.startsWith("webdav_") ||
+                item.id.startsWith("smb_") ||
+                item.id.startsWith("direct_") ||
+                item.filePath.startsWith("smb://", ignoreCase = true) ||
+                item.filePath.startsWith("http://") ||
+                item.filePath.startsWith("https://")
+            isDownloaded || !isNetworkOrCloud
         }
     }
 
     val nasMediaOnly = remember(filteredMedia) {
         filteredMedia.filter { item ->
             item.id.startsWith("nas_") ||
+            item.id.startsWith("truenas_") ||
             item.id.startsWith("webdav_") ||
-            item.filePath.startsWith("smb://") ||
-            (item.filePath.startsWith("http") && !item.filePath.contains("google"))
+            item.id.startsWith("smb_") ||
+            item.id.startsWith("direct_") ||
+            item.filePath.startsWith("smb://", ignoreCase = true) ||
+            ((item.filePath.startsWith("http://") || item.filePath.startsWith("https://")) &&
+                !item.id.startsWith("gdrive_") &&
+                !item.filePath.contains("drive.google.com") &&
+                !item.filePath.contains("googleapis.com"))
         }
     }
 
@@ -306,32 +321,70 @@ fun DashboardScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Column {
+                    Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = "LUMINA PLAYER",
-                            fontSize = 24.sp,
+                            fontSize = 22.sp,
                             fontWeight = FontWeight.ExtraBold,
                             letterSpacing = 2.sp,
                             color = Color(0xFF00E5FF)
                         )
                         Text(
-                            text = "Minimalist Local Cinema",
+                            text = "Local & Network Cinema",
                             fontSize = 12.sp,
                             color = Color.Gray
                         )
                     }
 
-                    IconButton(
-                        onClick = onNavigateToSettings,
-                        modifier = Modifier
-                            .background(Color(0xFF1B1B2A), CircleShape)
-                            .testTag("settings_shortcut_button")
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.Refresh,
-                            contentDescription = "Quick Scan",
-                            tint = Color(0xFF00E5FF)
-                        )
+                        val hasGemini = com.example.data.service.MetadataService.resolveGeminiApiKey(savedGeminiApiKey).isNotBlank()
+                        IconButton(
+                            onClick = {
+                                apiWizardStep = 0
+                                showApiWizardDialog = true
+                            },
+                            modifier = Modifier
+                                .background(
+                                    if (hasGemini) Color(0xFF1B1B2A) else Color(0xFF00E5FF).copy(alpha = 0.16f),
+                                    CircleShape
+                                )
+                                .testTag("ai_setup_shortcut_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.AutoAwesome,
+                                contentDescription = "AI API Setup Wizard",
+                                tint = if (hasGemini) Color(0xFF00E676) else Color(0xFFFFD54F)
+                            )
+                        }
+
+                        IconButton(
+                            onClick = { showTutorialDialog = true },
+                            modifier = Modifier
+                                .background(Color(0xFF1B1B2A), CircleShape)
+                                .testTag("tutorial_shortcut_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.HelpOutline,
+                                contentDescription = "App Tutorial",
+                                tint = Color.White
+                            )
+                        }
+
+                        IconButton(
+                            onClick = onRequestQuickScan,
+                            modifier = Modifier
+                                .background(Color(0xFF1B1B2A), CircleShape)
+                                .testTag("quick_scan_shortcut_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Refresh,
+                                contentDescription = "Quick Scan New Files",
+                                tint = Color(0xFF00E5FF)
+                            )
+                        }
                     }
                 }
 
@@ -391,7 +444,13 @@ fun DashboardScreen(
 
                 if (cleanMedia.isEmpty()) {
                     EmptyStateCard(
-                        onLoadDemo = { viewModel.loadDemoLibrary() },
+                        onQuickScan = onRequestQuickScan,
+                        onOpenTutorial = { showTutorialDialog = true },
+                        onOpenApiWizard = {
+                            apiWizardStep = 0
+                            showApiWizardDialog = true
+                        },
+                        onNavigateToCloud = onNavigateToCloud,
                         onNavigateToSettings = onNavigateToSettings
                     )
                 } else {
@@ -633,60 +692,35 @@ fun DashboardScreen(
                     }
                 }
 
-                // Render First-time media access popup
-                if (showFirstTimePermissionPopup) {
-                    AlertDialog(
-                        onDismissRequest = {
-                            prefs.edit().putBoolean("is_first_time_use", false).apply()
-                            showFirstTimePermissionPopup = false
+                // Interactive App Tutorial & Onboarding Dialog
+                if (showTutorialDialog) {
+                    AppTutorialDialog(
+                        viewModel = viewModel,
+                        onDismiss = {
+                            viewModel.markTutorialCompleted(context)
+                            showTutorialDialog = false
                         },
-                        icon = {
-                            Icon(
-                                imageVector = Icons.Default.Movie,
-                                contentDescription = null,
-                                tint = Color(0xFF00E5FF),
-                                modifier = Modifier.size(40.dp)
-                            )
+                        onRequestStorageAndScan = onRequestQuickScan,
+                        onOpenApiWizard = {
+                            viewModel.markTutorialCompleted(context)
+                            showTutorialDialog = false
+                            apiWizardStep = 0
+                            showApiWizardDialog = true
                         },
-                        title = {
-                            Text(
-                                text = "Lumina Player Media Access",
-                                color = Color.White,
-                                fontSize = 18.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-                        },
-                        text = {
-                            Text(
-                                text = "To automatically index and play your local Movies and TV Series, Lumina Player requires permission to access files on your device. This allows us to link your collection with beautiful covers and subtitles offline.",
-                                color = Color.LightGray,
-                                fontSize = 12.sp,
-                                lineHeight = 18.sp
-                            )
-                        },
-                        confirmButton = {
-                            Button(
-                                onClick = {
-                                    prefs.edit().putBoolean("is_first_time_use", false).apply()
-                                    showFirstTimePermissionPopup = false
-                                    onRequestPermission()
-                                },
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E5FF))
-                            ) {
-                                Text("Grant Access", color = Color.Black, fontWeight = FontWeight.Bold)
-                            }
-                        },
-                        dismissButton = {
-                            TextButton(
-                                onClick = {
-                                    prefs.edit().putBoolean("is_first_time_use", false).apply()
-                                    showFirstTimePermissionPopup = false
-                                }
-                            ) {
-                                Text("Not Now", color = Color.Gray)
-                            }
-                        },
-                        containerColor = Color(0xFF14141E)
+                        onNavigateToCloud = {
+                            viewModel.markTutorialCompleted(context)
+                            showTutorialDialog = false
+                            onNavigateToCloud()
+                        }
+                    )
+                }
+
+                // Step-by-step AI & Metadata API Setup Wizard
+                if (showApiWizardDialog) {
+                    ApiSetupWizardDialog(
+                        viewModel = viewModel,
+                        initialStep = apiWizardStep,
+                        onDismiss = { showApiWizardDialog = false }
                     )
                 }
 
@@ -697,6 +731,12 @@ fun DashboardScreen(
                         tvShow = null,
                         viewModel = viewModel,
                         apiKey = savedTmdbApiKey,
+                        savedGeminiKey = savedGeminiApiKey,
+                        onOpenApiWizard = {
+                            selectedMovieForFixMatch = null
+                            apiWizardStep = 0
+                            showApiWizardDialog = true
+                        },
                         onDismiss = { selectedMovieForFixMatch = null }
                     )
                 }
@@ -707,6 +747,12 @@ fun DashboardScreen(
                         tvShow = selectedShowForFixMatch,
                         viewModel = viewModel,
                         apiKey = savedTmdbApiKey,
+                        savedGeminiKey = savedGeminiApiKey,
+                        onOpenApiWizard = {
+                            selectedShowForFixMatch = null
+                            apiWizardStep = 0
+                            showApiWizardDialog = true
+                        },
                         onDismiss = { selectedShowForFixMatch = null }
                     )
                 }
@@ -811,7 +857,7 @@ fun TvShowDetailsView(
             val sourceLabel = if (showFirstEp != null) {
                 when {
                     showFirstEp.id.startsWith("gdrive_") || showFirstEp.filePath.contains("drive.google.com") || showFirstEp.filePath.contains("googleapis.com") -> "GDrive"
-                    showFirstEp.id.startsWith("nas_") || showFirstEp.id.startsWith("webdav_") || showFirstEp.filePath.startsWith("smb://") || (showFirstEp.filePath.startsWith("http") && !showFirstEp.filePath.contains("google")) -> "NAS"
+                    showFirstEp.id.startsWith("nas_") || showFirstEp.id.startsWith("truenas_") || showFirstEp.id.startsWith("webdav_") || showFirstEp.id.startsWith("smb_") || showFirstEp.id.startsWith("direct_") || showFirstEp.filePath.startsWith("smb://", ignoreCase = true) || (showFirstEp.filePath.startsWith("http") && !showFirstEp.filePath.contains("google")) -> "NAS"
                     else -> "Local"
                 }
             } else {
@@ -1119,7 +1165,10 @@ fun TvShowDetailsView(
                         }
 
                         // Download Action on the right of the row
-                        val isNetworkFile = ep.filePath.startsWith("http://") || ep.filePath.startsWith("https://")
+                        val isNetworkFile = ep.filePath.startsWith("http://") ||
+                            ep.filePath.startsWith("https://") ||
+                            ep.filePath.startsWith("smb://", ignoreCase = true) ||
+                            ep.id.startsWith("gdrive_")
                         if (isNetworkFile) {
                             val context = androidx.compose.ui.platform.LocalContext.current
                             val isDownloaded = (ep.filePath.startsWith("/") && java.io.File(ep.filePath).exists()) || viewModel.getDownloadedFile(context, ep).exists()
@@ -1933,59 +1982,128 @@ fun ContinueWatchingCard(
 
 @Composable
 fun EmptyStateCard(
-    onLoadDemo: () -> Unit,
+    onQuickScan: () -> Unit,
+    onOpenTutorial: () -> Unit,
+    onOpenApiWizard: () -> Unit,
+    onNavigateToCloud: () -> Unit,
     onNavigateToSettings: () -> Unit
 ) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 24.dp)
+            .padding(vertical = 16.dp)
             .testTag("empty_state_card"),
         colors = CardDefaults.cardColors(containerColor = Color(0xFF14141E)),
-        shape = RoundedCornerShape(16.dp)
+        shape = RoundedCornerShape(16.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF222235))
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(24.dp),
+                .verticalScroll(rememberScrollState())
+                .padding(22.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
             Icon(
                 imageVector = Icons.Default.Movie,
                 contentDescription = "Empty Cinema",
-                tint = Color(0xFF00E5FF).copy(alpha = 0.4f),
-                modifier = Modifier.size(72.dp)
+                tint = Color(0xFF00E5FF).copy(alpha = 0.55f),
+                modifier = Modifier.size(64.dp)
             )
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(14.dp))
             Text(
-                text = "Your library is empty",
-                fontSize = 18.sp,
-                fontWeight = FontWeight.Bold,
+                text = "Welcome to Lumina Player",
+                fontSize = 19.sp,
+                fontWeight = FontWeight.ExtraBold,
                 color = Color.White
             )
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(6.dp))
             Text(
-                text = "Lumina Player is an offline-first media hub. You can trigger a scan of your device's folders or link/sync your personal Cloud Sources (such as TrueNAS or Google Drive) in the settings menu.",
+                text = "Scan local video folders (new files auto-appear automatically once enabled), connect your SMB / WebDAV network storage, or walk through the setup tutorial.",
                 fontSize = 12.sp,
-                color = Color.Gray,
+                color = Color.LightGray,
                 lineHeight = 18.sp,
-                modifier = Modifier.padding(horizontal = 8.dp),
+                modifier = Modifier.padding(horizontal = 4.dp),
                 textAlign = androidx.compose.ui.text.style.TextAlign.Center
             )
-            Spacer(modifier = Modifier.height(24.dp))
+            Spacer(modifier = Modifier.height(20.dp))
 
-            OutlinedButton(
-                onClick = onNavigateToSettings,
+            Button(
+                onClick = onQuickScan,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(48.dp)
-                    .testTag("settings_navigate_button"),
-                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF00E5FF)),
-                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF2E2E3E)),
+                    .testTag("empty_quick_scan_button"),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E5FF)),
                 shape = RoundedCornerShape(10.dp)
             ) {
-                Text("Scan Storage & Link Cloud Sources", fontWeight = FontWeight.Bold)
+                Icon(Icons.Default.Refresh, contentDescription = null, tint = Color.Black, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Quick Scan Device Storage", color = Color.Black, fontWeight = FontWeight.Bold)
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                OutlinedButton(
+                    onClick = onOpenTutorial,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(46.dp)
+                        .testTag("empty_tutorial_button"),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF2E2E3E)),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Icon(Icons.AutoMirrored.Filled.HelpOutline, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Tutorial", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                }
+
+                OutlinedButton(
+                    onClick = onOpenApiWizard,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(46.dp)
+                        .testTag("empty_api_wizard_button"),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF00E5FF)),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF00E5FF).copy(alpha = 0.45f)),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("AI Setup", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            OutlinedButton(
+                onClick = onNavigateToCloud,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(46.dp)
+                    .testTag("empty_network_storage_button"),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFFF9100)),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFFF9100).copy(alpha = 0.45f)),
+                shape = RoundedCornerShape(10.dp)
+            ) {
+                Icon(Icons.Default.CloudQueue, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Connect Network Storage (SMB / WebDAV)", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            TextButton(
+                onClick = onNavigateToSettings,
+                modifier = Modifier.testTag("settings_navigate_button")
+            ) {
+                Text("Manage Folders & Settings", color = Color.Gray, fontSize = 12.sp)
             }
         }
     }
@@ -1997,18 +2115,22 @@ fun FixMatchDialog(
     tvShow: TvShow?,
     viewModel: MediaViewModel,
     apiKey: String,
+    savedGeminiKey: String = "",
+    onOpenApiWizard: () -> Unit = {},
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    
-    var searchQuery by remember { 
-        mutableStateOf(movieItem?.title ?: tvShow?.showName ?: "") 
+    val hasGeminiKey = com.example.data.service.MetadataService.resolveGeminiApiKey(savedGeminiKey).isNotBlank()
+    val hasTmdbKey = apiKey.isNotBlank() && apiKey != "MY_TMDB_API_KEY"
+
+    var searchQuery by remember {
+        mutableStateOf(movieItem?.title ?: tvShow?.showName ?: "")
     }
     var isSearching by remember { mutableStateOf(false) }
     var searchResults by remember { mutableStateOf<List<com.example.data.service.MetadataService.UnifiedTmdbResult>>(emptyList()) }
     var searchError by remember { mutableStateOf<String?>(null) }
-    
+
     var manualTmdbId by remember { mutableStateOf("") }
     var isFetchingById by remember { mutableStateOf(false) }
 
@@ -2018,8 +2140,8 @@ fun FixMatchDialog(
             searchError = null
             try {
                 val results = com.example.data.service.MetadataService.searchTmdb(
-                    apiKey, 
-                    searchQuery, 
+                    apiKey,
+                    searchQuery,
                     if (movieItem != null) "MOVIE" else "TV"
                 )
                 searchResults = results
@@ -2053,13 +2175,27 @@ fun FixMatchDialog(
                     .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
-                if (apiKey.isBlank()) {
-                    Text(
-                        text = "⚠ TMDb API Key is not configured in Settings. Please set one up to enable online search and custom ID linking.",
-                        color = Color(0xFFFF9800),
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Medium
-                    )
+                if (!hasTmdbKey && !hasGeminiKey) {
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF231A10)),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFFF9800).copy(alpha = 0.45f)),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp)) {
+                            Text(
+                                text = "Configure a free Gemini or TMDb API key for smart artwork & ID matching.",
+                                color = Color(0xFFFFB74D),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Medium
+                            )
+                            TextButton(
+                                onClick = onOpenApiWizard,
+                                contentPadding = PaddingValues(0.dp)
+                            ) {
+                                Text("Open Step-by-Step AI Setup Wizard", color = Color(0xFF00E5FF), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
                 }
 
                 // Title of item being fixed
@@ -2073,7 +2209,7 @@ fun FixMatchDialog(
                 Spacer(modifier = Modifier.height(4.dp))
 
                 // Search Box Row
-                Text("Search online TMDb database:", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                Text("Search online database:", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
@@ -2098,17 +2234,13 @@ fun FixMatchDialog(
 
                     Button(
                         onClick = {
-                            if (apiKey.isBlank() && (com.example.BuildConfig.GEMINI_API_KEY.isBlank() || com.example.BuildConfig.GEMINI_API_KEY == "MY_GEMINI_API_KEY")) {
-                                android.widget.Toast.makeText(context, "Please set TMDb API Key in Settings or configure Gemini API key", android.widget.Toast.LENGTH_LONG).show()
-                                return@Button
-                            }
                             if (searchQuery.isBlank()) return@Button
                             isSearching = true
                             searchError = null
                             scope.launch {
                                 val results = com.example.data.service.MetadataService.searchTmdb(
-                                    apiKey, 
-                                    searchQuery, 
+                                    apiKey,
+                                    searchQuery,
                                     if (movieItem != null) "MOVIE" else "TV"
                                 )
                                 searchResults = results
@@ -2158,8 +2290,8 @@ fun FixMatchDialog(
                                 android.widget.Toast.makeText(context, "Please enter a valid numeric TMDb ID", android.widget.Toast.LENGTH_SHORT).show()
                                 return@Button
                             }
-                            if (apiKey.isBlank() && com.example.BuildConfig.GEMINI_API_KEY.isBlank()) {
-                                android.widget.Toast.makeText(context, "Please set TMDB API Key in Settings or configure Gemini API Key first", android.widget.Toast.LENGTH_LONG).show()
+                            if (!hasTmdbKey && !hasGeminiKey) {
+                                android.widget.Toast.makeText(context, "Please set up a TMDb or Gemini API key via the Setup Wizard first.", android.widget.Toast.LENGTH_LONG).show()
                                 return@Button
                             }
                             isFetchingById = true

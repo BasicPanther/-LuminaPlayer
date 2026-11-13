@@ -1,15 +1,26 @@
 package com.example.ui.viewmodel
 
 import android.content.Context
+import android.database.ContentObserver
+import android.os.Build
+import android.os.Environment
+import android.os.FileObserver
+import android.os.Handler
+import android.os.Looper
+import android.provider.MediaStore
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.example.data.database.AppDatabase
-import com.example.data.model.MediaItem
 import com.example.data.model.CloudSource
+import com.example.data.model.MediaItem
 import com.example.data.model.PlaybackHistory
 import com.example.data.repository.MediaRepository
+import com.example.data.service.CloudSyncService
+import com.example.data.service.MetadataService
+import com.example.data.service.SmbNetworkService
+import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import java.io.File
@@ -63,6 +74,18 @@ class MediaViewModel(private val repository: MediaRepository) : ViewModel() {
     private val _omdbApiKey = MutableStateFlow("")
     val omdbApiKey: StateFlow<String> = _omdbApiKey.asStateFlow()
 
+    private val _geminiApiKey = MutableStateFlow("")
+    val geminiApiKey: StateFlow<String> = _geminiApiKey.asStateFlow()
+
+    private val _autoWatchEnabled = MutableStateFlow(true)
+    val autoWatchEnabled: StateFlow<Boolean> = _autoWatchEnabled.asStateFlow()
+
+    private val _tutorialCompleted = MutableStateFlow(false)
+    val tutorialCompleted: StateFlow<Boolean> = _tutorialCompleted.asStateFlow()
+
+    private val _lastScanBanner = MutableStateFlow("")
+    val lastScanBanner: StateFlow<String> = _lastScanBanner.asStateFlow()
+
     private val _autoplayEnabled = MutableStateFlow(true)
     val autoplayEnabled: StateFlow<Boolean> = _autoplayEnabled.asStateFlow()
 
@@ -82,14 +105,128 @@ class MediaViewModel(private val repository: MediaRepository) : ViewModel() {
     private val _subStyleFont = MutableStateFlow("DEFAULT")
     val subStyleFont: StateFlow<String> = _subStyleFont.asStateFlow()
 
+    // Live filesystem & MediaStore watchers for automatic new-file detection
+    private var mediaStoreObserver: ContentObserver? = null
+    private val activeFileObservers = mutableListOf<FileObserver>()
+    private var watchedAppContext: Context? = null
+    private val autoWatchTrigger = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    private var isWatcherInitialized = false
+
+    @OptIn(FlowPreview::class)
+    private fun ensureAutoWatchCollector(appContext: Context) {
+        if (isWatcherInitialized) return
+        isWatcherInitialized = true
+        viewModelScope.launch {
+            autoWatchTrigger
+                .debounce(1400L)
+                .collect {
+                    if (_autoWatchEnabled.value && !_isScanning.value) {
+                        scanNewMediaOnly(appContext, silent = true)
+                    }
+                }
+        }
+    }
+
+    fun startWatchingMedia(context: Context) {
+        val appCtx = context.applicationContext
+        watchedAppContext = appCtx
+        ensureAutoWatchCollector(appCtx)
+
+        if (!_autoWatchEnabled.value) {
+            stopWatchingMedia()
+            return
+        }
+
+        // Register MediaStore ContentObserver once
+        if (mediaStoreObserver == null) {
+            try {
+                val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+                    override fun onChange(selfChange: Boolean) {
+                        super.onChange(selfChange)
+                        autoWatchTrigger.tryEmit(Unit)
+                    }
+                }
+                appCtx.contentResolver.registerContentObserver(
+                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                    true,
+                    observer
+                )
+                mediaStoreObserver = observer
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to register MediaStore observer: ${e.message}")
+            }
+        }
+
+        // Rebuild FileObservers for configured directories
+        rebuildFileObservers()
+    }
+
+    private fun rebuildFileObservers() {
+        activeFileObservers.forEach { runCatching { it.stopWatching() } }
+        activeFileObservers.clear()
+        if (!_autoWatchEnabled.value) return
+
+        val mask = FileObserver.CLOSE_WRITE or FileObserver.MOVED_TO or FileObserver.DELETE or FileObserver.MOVED_FROM
+        _scannedFolders.value.forEach { path ->
+            val dir = File(path)
+            if (dir.exists() && dir.isDirectory) {
+                try {
+                    val observer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        object : FileObserver(dir, mask) {
+                            override fun onEvent(event: Int, p: String?) {
+                                autoWatchTrigger.tryEmit(Unit)
+                            }
+                        }
+                    } else {
+                        @Suppress("DEPRECATION")
+                        object : FileObserver(dir.absolutePath, mask) {
+                            override fun onEvent(event: Int, p: String?) {
+                                autoWatchTrigger.tryEmit(Unit)
+                            }
+                        }
+                    }
+                    observer.startWatching()
+                    activeFileObservers.add(observer)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Cannot watch directory $path: ${e.message}")
+                }
+            }
+        }
+    }
+
+    fun stopWatchingMedia() {
+        watchedAppContext?.let { ctx ->
+            mediaStoreObserver?.let { obs ->
+                runCatching { ctx.contentResolver.unregisterContentObserver(obs) }
+            }
+        }
+        mediaStoreObserver = null
+        activeFileObservers.forEach { runCatching { it.stopWatching() } }
+        activeFileObservers.clear()
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        stopWatchingMedia()
+    }
+
     fun loadPreferences(context: Context) {
         val prefs = context.getSharedPreferences("lumina_player_prefs", Context.MODE_PRIVATE)
-        
+
         // TMDB API key
         _tmdbApiKey.value = prefs.getString("tmdb_api_key", "") ?: ""
 
         // OMDB API key
         _omdbApiKey.value = prefs.getString("omdb_api_key", "") ?: ""
+
+        // Gemini AI API key (user-saved or BuildConfig fallback)
+        val savedGem = prefs.getString("gemini_api_key", "") ?: ""
+        _geminiApiKey.value = savedGem
+        MetadataService.activeGeminiApiKey = savedGem
+
+        // Auto-watch & tutorial flags
+        _autoWatchEnabled.value = prefs.getBoolean("auto_watch_enabled", true)
+        _tutorialCompleted.value = prefs.getBoolean("tutorial_completed", !prefs.getBoolean("is_first_time_use", true))
 
         // Autoplay enabled
         _autoplayEnabled.value = prefs.getBoolean("autoplay_enabled", true)
@@ -100,24 +237,78 @@ class MediaViewModel(private val repository: MediaRepository) : ViewModel() {
         _subStyleTextSize.value = prefs.getFloat("sub_style_text_size", 1.0f)
         _subStyleFont.value = prefs.getString("sub_style_font", "DEFAULT") ?: "DEFAULT"
 
-        // Directories to scan
+        // Directories to scan (includes standard Movies & Download folders by default if accessible)
         val foldersSet = prefs.getStringSet("scanned_directories", null)
         if (foldersSet == null) {
-            val defaults = listOf(
+            val defaults = mutableListOf(
                 File(context.filesDir, "Movies").absolutePath,
-                File(context.filesDir, "Shows").absolutePath,
-                File(context.cacheDir, "Movies").absolutePath
+                File(context.filesDir, "Shows").absolutePath
             )
-            // Create directories if they don't exist so user can select/see them
-            defaults.forEach { path ->
+            try {
+                val publicMovies = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
+                if (publicMovies != null) defaults.add(publicMovies.absolutePath)
+                val publicDownloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                if (publicDownloads != null) defaults.add(publicDownloads.absolutePath)
+            } catch (_: Exception) {}
+
+            defaults.take(2).forEach { path ->
                 val f = File(path)
                 if (!f.exists()) f.mkdirs()
             }
-            _scannedFolders.value = defaults
-            prefs.edit().putStringSet("scanned_directories", defaults.toSet()).apply()
+            val cleanDefaults = defaults.distinct().sorted()
+            _scannedFolders.value = cleanDefaults
+            prefs.edit().putStringSet("scanned_directories", cleanDefaults.toSet()).apply()
         } else {
             _scannedFolders.value = foldersSet.toList().sorted()
         }
+    }
+
+    fun markTutorialCompleted(context: Context) {
+        val prefs = context.getSharedPreferences("lumina_player_prefs", Context.MODE_PRIVATE)
+        prefs.edit()
+            .putBoolean("tutorial_completed", true)
+            .putBoolean("is_first_time_use", false)
+            .apply()
+        _tutorialCompleted.value = true
+    }
+
+    fun setAutoWatchEnabled(context: Context, enabled: Boolean) {
+        val prefs = context.getSharedPreferences("lumina_player_prefs", Context.MODE_PRIVATE)
+        prefs.edit().putBoolean("auto_watch_enabled", enabled).apply()
+        _autoWatchEnabled.value = enabled
+        if (enabled) startWatchingMedia(context) else stopWatchingMedia()
+    }
+
+    fun saveGeminiApiKey(context: Context, key: String) {
+        val clean = key.trim()
+        val prefs = context.getSharedPreferences("lumina_player_prefs", Context.MODE_PRIVATE)
+        prefs.edit().putString("gemini_api_key", clean).apply()
+        _geminiApiKey.value = clean
+        MetadataService.activeGeminiApiKey = clean
+    }
+
+    suspend fun verifyAndSaveGeminiKey(context: Context, key: String): Result<String> {
+        val result = MetadataService.verifyGeminiApiKey(key)
+        if (result.isSuccess) {
+            saveGeminiApiKey(context, key)
+        }
+        return result
+    }
+
+    suspend fun verifyAndSaveTmdbKey(context: Context, key: String): Result<String> {
+        val result = MetadataService.verifyTmdbApiKey(key)
+        if (result.isSuccess) {
+            saveTmdbApiKey(context, key)
+        }
+        return result
+    }
+
+    suspend fun verifyAndSaveOmdbKey(context: Context, key: String): Result<String> {
+        val result = MetadataService.verifyOmdbApiKey(key)
+        if (result.isSuccess) {
+            saveOmdbApiKey(context, key)
+        }
+        return result
     }
 
     fun saveTmdbApiKey(context: Context, key: String) {
@@ -268,10 +459,29 @@ class MediaViewModel(private val repository: MediaRepository) : ViewModel() {
 
     fun downloadEpisode(context: Context, ep: MediaItem) {
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-            val isNetworkFile = ep.filePath.startsWith("http://") || ep.filePath.startsWith("https://")
-            if (!isNetworkFile) return@launch
+            val isSmbFile = ep.filePath.startsWith("smb://", ignoreCase = true)
+            val isHttpFile = ep.filePath.startsWith("http://") || ep.filePath.startsWith("https://")
+            if (!isSmbFile && !isHttpFile) return@launch
 
             _downloadProgress.update { it + (ep.id to 0.01f) }
+
+            if (isSmbFile) {
+                try {
+                    val localFile = getDownloadTargetFile(context, ep)
+                    val ok = SmbNetworkService.downloadSmbFile(ep.filePath, localFile) { progress ->
+                        _downloadProgress.update { it + (ep.id to progress) }
+                    }
+                    if (ok) {
+                        val updatedItem = ep.copy(isFavorite = ep.isFavorite)
+                        repository.updateMediaItem(updatedItem)
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to download SMB episode ${ep.title}", e)
+                } finally {
+                    _downloadProgress.update { it - ep.id }
+                }
+                return@launch
+            }
 
             try {
                 var finalUrl = ep.filePath
@@ -402,9 +612,9 @@ class MediaViewModel(private val repository: MediaRepository) : ViewModel() {
                 }
                 val updatedItem = ep.copy(filePath = cloudUrl)
                 repository.updateMediaItem(updatedItem)
-            } else if (ep.id.startsWith("truenas_")) {
-                // TrueNAS files use our transparent downloaded file path checking, so we don't overwrite filePath in the DB.
-                // We just trigger a dummy update in the Room Database to force the UI to recompose and show "Not Downloaded" instantly.
+            } else if (ep.id.startsWith("truenas_") || ep.id.startsWith("webdav_") || ep.id.startsWith("smb_")) {
+                // Network files use transparent downloaded file path checking, so we keep the stream URL intact.
+                // Trigger a DB update so Compose recomposes immediately to reflect deletion.
                 val updatedItem = ep.copy(isFavorite = ep.isFavorite)
                 repository.updateMediaItem(updatedItem)
             }
@@ -503,6 +713,9 @@ class MediaViewModel(private val repository: MediaRepository) : ViewModel() {
         foldersSet.add(cleanPath)
         prefs.edit().putStringSet("scanned_directories", foldersSet).apply()
         _scannedFolders.value = foldersSet.toList().sorted()
+        rebuildFileObservers()
+        // Immediately scan newly added folder for files
+        scanNewMediaOnly(context, silent = false)
     }
 
     fun removeScannedFolder(context: Context, path: String) {
@@ -511,28 +724,74 @@ class MediaViewModel(private val repository: MediaRepository) : ViewModel() {
         foldersSet.remove(path)
         prefs.edit().putStringSet("scanned_directories", foldersSet).apply()
         _scannedFolders.value = foldersSet.toList().sorted()
+        rebuildFileObservers()
     }
 
-    fun scanLocalMedia(context: Context) {
+    /**
+     * Ultra-fast incremental scan: only inspects NEW or DELETED files.
+     * Used automatically on app resume, ContentObserver events, and Quick Scan button.
+     */
+    fun scanNewMediaOnly(context: Context, silent: Boolean = false) {
+        if (_isScanning.value) return
+        viewModelScope.launch {
+            if (!silent) {
+                _isScanning.value = true
+                _scanStatus.value = "Quick scanning for new files..."
+            }
+            try {
+                if (_scannedFolders.value.isEmpty()) loadPreferences(context)
+                val folders = _scannedFolders.value
+                if (folders.isEmpty()) {
+                    if (!silent) _scanStatus.value = "No folders selected to scan."
+                    return@launch
+                }
+                val result = repository.scanIncremental(
+                    context = context,
+                    foldersList = folders,
+                    apiKey = _tmdbApiKey.value.ifBlank { null },
+                    omdbApiKey = _omdbApiKey.value.ifBlank { null },
+                    includeMediaStoreAll = false
+                ) { progress ->
+                    if (!silent) _scanStatus.value = progress
+                }
+                if (result.addedCount > 0) {
+                    val bannerMsg = "Detected ${result.addedCount} new video(s)"
+                    _lastScanBanner.value = bannerMsg
+                    _scanStatus.value = bannerMsg
+                } else if (!silent) {
+                    _scanStatus.value = "Library up to date (${result.totalScannedFiles} files)."
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Incremental scan failed: ", e)
+                if (!silent) _scanStatus.value = "Quick scan failed: ${e.localizedMessage}"
+            } finally {
+                if (!silent) _isScanning.value = false
+            }
+        }
+    }
+
+    fun clearScanBanner() {
+        _lastScanBanner.value = ""
+    }
+
+    fun scanLocalMedia(context: Context, forceDeep: Boolean = true) {
         viewModelScope.launch {
             _isScanning.value = true
-            _scanStatus.value = "Starting media library scan..."
+            _scanStatus.value = if (forceDeep) "Starting deep media library scan..." else "Quick scanning new files..."
             try {
-                // Ensure preferences are loaded
                 loadPreferences(context)
                 val apiKey = _tmdbApiKey.value.ifBlank { null }
                 val omdbKey = _omdbApiKey.value.ifBlank { null }
                 val folders = _scannedFolders.value
-                
+
                 if (folders.isEmpty()) {
                     _scanStatus.value = "No directories selected to scan!"
                     return@launch
                 }
-                
-                repository.scanDevice(context, folders, apiKey, omdbKey) { progress ->
+
+                repository.scanDevice(context, folders, apiKey, omdbKey, forceDeepRefresh = forceDeep) { progress ->
                     _scanStatus.value = progress
                 }
-                _scanStatus.value = "Scan completed successfully."
             } catch (e: Exception) {
                 Log.e(TAG, "Scan failed: ", e)
                 _scanStatus.value = "Scan failed: ${e.localizedMessage}"
@@ -589,13 +848,27 @@ class MediaViewModel(private val repository: MediaRepository) : ViewModel() {
         }
     }
 
-    fun connectCloudAccount(type: String, name: String, url: String? = null, token: String? = null) {
+    fun connectCloudAccount(
+        context: Context? = null,
+        type: String,
+        name: String,
+        url: String? = null,
+        token: String? = null,
+        autoSync: Boolean = true
+    ) {
         viewModelScope.launch {
             _isSyncing.value = true
             _syncStatus.value = "Connecting to $name..."
             try {
-                repository.connectCloud(type, name, url, token)
-                _syncStatus.value = "$name connected successfully."
+                val source = repository.connectCloud(type, name, url, token)
+                _syncStatus.value = "$name connected."
+                if (autoSync && context != null) {
+                    val apiKey = _tmdbApiKey.value.ifBlank { null }
+                    val omdbKey = _omdbApiKey.value.ifBlank { null }
+                    repository.syncCloud(context, source, apiKey, omdbKey) { progress ->
+                        _syncStatus.value = progress
+                    }
+                }
             } catch (e: Exception) {
                 Log.e(TAG, "Connection failed: ", e)
                 _syncStatus.value = "Connection failed: ${e.localizedMessage}"
@@ -605,10 +878,20 @@ class MediaViewModel(private val repository: MediaRepository) : ViewModel() {
         }
     }
 
+    fun disconnectCloudAccount(source: CloudSource, removeMedia: Boolean = true) {
+        viewModelScope.launch {
+            repository.deleteCloudSource(source.id)
+            if (removeMedia) {
+                repository.deleteMediaByFolder(source.name)
+            }
+            _syncStatus.value = "${source.name} disconnected."
+        }
+    }
+
     fun disconnectCloudAccount(id: String) {
         viewModelScope.launch {
             repository.deleteCloudSource(id)
-            _syncStatus.value = "Account disconnected."
+            _syncStatus.value = "Source disconnected."
         }
     }
 

@@ -76,10 +76,43 @@ class MediaRepository(private val mediaDao: MediaDao) {
     suspend fun clearAll() =
         mediaDao.clearAllMedia()
 
+    suspend fun deleteMediaByFolder(folderPath: String) =
+        mediaDao.deleteMediaByFolder(folderPath)
+
     // Scanner actions
-    suspend fun scanDevice(context: Context, foldersList: List<String>, apiKey: String?, omdbApiKey: String? = null, onProgress: (String) -> Unit) {
-        LocalMediaScanner.scanDeviceStorage(context, mediaDao, foldersList, apiKey, omdbApiKey, onProgress)
-    }
+    suspend fun scanIncremental(
+        context: Context,
+        foldersList: List<String>,
+        apiKey: String?,
+        omdbApiKey: String? = null,
+        includeMediaStoreAll: Boolean = false,
+        onProgress: (String) -> Unit
+    ) = LocalMediaScanner.scanIncremental(
+        context = context,
+        mediaDao = mediaDao,
+        foldersList = foldersList,
+        tmdbApiKey = apiKey,
+        omdbApiKey = omdbApiKey,
+        includeMediaStoreAll = includeMediaStoreAll,
+        onProgress = onProgress
+    )
+
+    suspend fun scanDevice(
+        context: Context,
+        foldersList: List<String>,
+        apiKey: String?,
+        omdbApiKey: String? = null,
+        forceDeepRefresh: Boolean = true,
+        onProgress: (String) -> Unit
+    ) = LocalMediaScanner.scanDeviceStorage(
+        context = context,
+        mediaDao = mediaDao,
+        foldersList = foldersList,
+        tmdbApiKey = apiKey,
+        omdbApiKey = omdbApiKey,
+        forceDeepRefresh = forceDeepRefresh,
+        onProgress = onProgress
+    )
 
     suspend fun loadDemoLibrary() {
         LocalMediaScanner.populateSampleMediaHub(mediaDao)
